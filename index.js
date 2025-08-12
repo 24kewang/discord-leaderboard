@@ -22,6 +22,41 @@ const CREDENTIALS_PATH = process.env.CREDENTIALS_PATH;
 const SHEET_NAME = process.env.SHEET_NAME;
 const ALLOWED_ROLES = ['membership']; // Discord roles for running commands
 
+// ============================================================================
+// CENTRALIZED COLUMN CONFIGURATION
+// ============================================================================
+// Define the spreadsheet columns structure here - modify this to change columns
+const SHEET_COLUMNS = {
+  NAME: 'Name',
+  DISPLAY_NAME: 'Display_Name',
+  DISCORD_USERNAME: 'Discord_Username',
+  DISCORD_ID: 'Discord_ID',
+  POINTS: 'Points',
+  LAST_UPDATE: 'Last_Update'
+};
+
+// Define the order of columns in the spreadsheet (left to right)
+const COLUMN_ORDER = [
+  SHEET_COLUMNS.NAME,
+  SHEET_COLUMNS.DISPLAY_NAME,
+  SHEET_COLUMNS.DISCORD_USERNAME,
+  SHEET_COLUMNS.DISCORD_ID,
+  SHEET_COLUMNS.POINTS,
+  SHEET_COLUMNS.LAST_UPDATE
+];
+
+// Helper function to get column index by name
+function getColumnIndex(columnName) {
+  return COLUMN_ORDER.findIndex(col => col.toLowerCase() === columnName.toLowerCase());
+}
+
+// Helper function to get the spreadsheet range based on column count
+function getSheetRange() {
+  const lastColumn = String.fromCharCode(65 + COLUMN_ORDER.length - 1); // A=65, B=66, etc.
+  return `${SHEET_NAME}!A:${lastColumn}`;
+}
+// ============================================================================
+
 // Ensure the logs directory do exist
 const logsDir = path.resolve(__dirname, 'logs');
 if (!fs.existsSync(logsDir)) {
@@ -90,7 +125,7 @@ async function authenticateSheets() {
 async function fetchSheetData(sheets) {
   const response = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET_NAME}!A:N`,
+    range: getSheetRange(),
   });
   return response.data.values || [];
 }
@@ -99,7 +134,7 @@ async function fetchSheetData(sheets) {
 async function writeSheetData(sheets, rows) {
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
-    range: `${SHEET_NAME}!A:N`,
+    range: getSheetRange(),
     valueInputOption: 'RAW',
     requestBody: { values: rows },
   });
@@ -107,10 +142,6 @@ async function writeSheetData(sheets, rows) {
 
 // Generate a table image using Puppeteer with dynamic viewport size
 async function generateTableImage(headers, data, fileName = 'table.png') {
-  // Limit headers and data to the first 12 columns
-  const limitedHeaders = headers.slice(0, 12);
-  const limitedData = data.map((row) => row.slice(0, 12));
-
   const html = `
     <!DOCTYPE html>
     <html>
@@ -126,10 +157,10 @@ async function generateTableImage(headers, data, fileName = 'table.png') {
       <body>
         <table>
           <thead>
-            <tr>${limitedHeaders.map((header) => `<th>${header}</th>`).join('')}</tr>
+            <tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr>
           </thead>
           <tbody>
-            ${limitedData.map((row) => `<tr>${row.map((cell) => `<td>${cell || ''}</td>`).join('')}</tr>`).join('')}
+            ${data.map((row) => `<tr>${row.map((cell) => `<td>${cell || ''}</td>`).join('')}</tr>`).join('')}
           </tbody>
         </table>
       </body>
@@ -142,19 +173,16 @@ async function generateTableImage(headers, data, fileName = 'table.png') {
   // Load the HTML content
   await page.setContent(html);
 
-  // Select the table and get the bounding box for the first 12 columns
+  // Select the table and get the bounding box
   const tableHandle = await page.$('table');
   const boundingBox = await tableHandle.boundingBox();
 
-  // Calculate column widths based on the table's bounding box
-  const columnWidth = boundingBox.width / headers.length;
-  const viewportWidth = columnWidth * limitedHeaders.length;
-
-  // Set viewport size to exactly match the first 12 columns
+  // Set viewport size to match the table
   const viewportHeight = boundingBox.height + 40; // Add padding for margins
+  const viewportWidth = boundingBox.width + 40; // Add padding for margins
   await page.setViewport({ width: Math.ceil(viewportWidth), height: Math.ceil(viewportHeight) });
 
-  // Take a screenshot of the adjusted viewport
+  // Take a screenshot of the table
   await page.screenshot({ path: fileName, clip: boundingBox });
 
   await browser.close();
@@ -163,42 +191,31 @@ async function generateTableImage(headers, data, fileName = 'table.png') {
 // Register commands
 const commands = [
     {
-      name: 'artisan-update',
-      description: 'Add or update data for a Member.',
+      name: 'member-update',
+      description: 'Add or update member data.',
       options: [
-          { name: 'name', description: 'Update or add data for a specific Member Name,(case-insensitive).', type: 3, required: true },
-          { name: 'profession_1', description: 'Your First Profession 1.', type: 3, required: false },
-          { name: 'level_1', description: 'Level of your Profession 1, (e.g., Grandmaster / Master / Journeyman / Apprentice).', type: 3, required: false },
-          { name: 'profession_2', description: 'Your Second Profession 2.', type: 3, required: false },
-          { name: 'level_2', description: 'Level of your Profession 2, (e.g., Grandmaster / Master / Journeyman / Apprentice)..', type: 3, required: false },
-          { name: 'profession_3', description: 'Your Third Profession 3.', type: 3, required: false },
-          { name: 'level_3', description: 'Level of your Profession 3, (e.g., Grandmaster / Master / Journeyman / Apprentice)..', type: 3, required: false },
-          { name: 'profession_4', description: 'Your Fourth Profession 4.', type: 3, required: false },
-          { name: 'level_4', description: 'Level of your Profession 4, (e.g., Grandmaster / Master / Journeyman / Apprentice)..', type: 3, required: false },
-          { name: 'profession_5', description: 'Your Fifth Profession 5.', type: 3, required: false },
-          { name: 'level_5', description: 'Level of your Profession 5, (e.g., Grandmaster / Master / Journeyman / Apprentice)..', type: 3, required: false },
+          { name: 'name', description: 'Member name (case-insensitive).', type: 3, required: true },
+          { name: 'points', description: 'Points to set for the member.', type: 4, required: false },
           { name: 'discord_id', description: 'Discord ID of the member to update. Required for allowed roles to update another member.', type: 3, required: false },
         ],
     },
     {
-      name: 'artisan-search',
-      description: 'Search Professions for a Member or an expertise of a Profession.',
+      name: 'member-search',
+      description: 'Search for members by name or view all members.',
       options: [
-        { name: 'search_for', description: 'Member or Professions to search.', type: 3, required: true },
-        { name: 'columns', description: '"Any" to search all, or Profession_1, Profession_2, Profession_3, Profession_4, Profession_5', type: 3, required: true },
-        { name: 'level', description: 'Filter results by profession level', type: 3, required: false },
+        { name: 'search_for', description: 'Member name to search for, or "all" to show all members.', type: 3, required: true },
       ],
     },
     {
-      name: 'artisan-logs',
-      description: 'Manage logs (view, download or clear), This is restricted.',
+      name: 'member-logs',
+      description: 'Manage logs (view, download or clear). This is restricted.',
       options: [
           { name: 'action', description: 'View, download, or clear logs', type: 3, required: true, choices: [
               { name: 'View', value: 'view' },
               { name: 'Download', value: 'download' },
               { name: 'Clear', value: 'clear' },
           ] },
-          { name: 'lines', description: 'Number of last lines to view (this only work for "View" action)', type: 4, required: false },
+          { name: 'lines', description: 'Number of last lines to view (only works for "View" action)', type: 4, required: false },
           { name: 'date', description: 'Specify a date (YYYY-MM-DD) for previous logs', type: 3, required: false },
       ],
   },
@@ -224,338 +241,325 @@ client.on('interactionCreate', async (interaction) => {
   try {
     const sheets = await authenticateSheets();
     const rows = await fetchSheetData(sheets);
+    
+    // Ensure we have headers, if not create them
+    if (rows.length === 0) {
+      rows.push(COLUMN_ORDER);
+    }
+    
     const headers = rows[0];
 
-    const validColumns = headers.slice(0, 14);
-    const validColumnsearch = headers.slice(0, 12);
-    const restrictedRows = rows.map((row) => row.slice(0, 14));
+    // Handle member-update command
+    if (commandName === 'member-update') {
+      try {
+        const memberName = capitalize(options.getString('name'));
+        const userDiscordId = interaction.user.id;
+        const userDisplayName = interaction.member.displayName;
+        const userDiscordUsername = interaction.user.username;
+        const discordIdOption = options.getString('discord_id');
+        const pointsValue = options.getInteger('points');
+        const timestamp = moment().tz('America/Chicago').format('YYYY-MM-DD HH:mm:ss');
+        
+        // Check if the user has allowed roles
+        const isAllowedRole = ALLOWED_ROLES.some((role) => interaction.member.roles.cache.some((r) => r.name === role));
 
-// Inside artisan-update command handler
-if (commandName === 'artisan-update') {
-  try {
-    const userId = capitalize(options.getString('name'));
-    const userDiscordId = interaction.user.id;
-    const userDisplayName = interaction.member.displayName;
-    const discordIdOption = options.getString('discord_id');
-    const updates = {};
+        // If discord_id is provided and user has allowed role, update another member
+        if (discordIdOption && isAllowedRole) {
+          const targetRowIndex = rows.findIndex((row, index) => 
+            index > 0 && row[getColumnIndex(SHEET_COLUMNS.DISCORD_ID)] === discordIdOption
+          );
 
-    // Extract updates from command options
-    ['profession_1', 'level_1', 'profession_2', 'level_2', 'profession_3', 'level_3', 'profession_4', 'level_4', 'profession_5', 'level_5'].forEach((option) => {
-      const value = options.getString(option);
-      if (value) updates[option] = capitalize(value);
-    });
-
-    const timestamp = moment().tz('America/Chicago').format('YYYY-MM-DD HH:mm:ss'); // Get current timestamp in CST
-    
-    // Check if the user has allowed roles
-    const isAllowedRole = ALLOWED_ROLES.some((role) => interaction.member.roles.cache.some((r) => r.name === role));
-
-    if (discordIdOption && isAllowedRole) {
-      const discordIdRowIndex = restrictedRows.findIndex(
-        (row) => row[validColumns.findIndex((col) => col.toLowerCase() === 'discord_id')] === discordIdOption
-      );
-
-      if (discordIdRowIndex === -1) {
-        log('warn', `[UPDATE FAILED] Discord ID not found`, {
-          executor: { discord_id: userDiscordId, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-          target: { discord_id: discordIdOption },
-          command: { name: commandName },
-          options: updates,
-        });
-        await interaction.reply(`No member found with Discord ID: ${discordIdOption}`);
-        return;
-      }
-      
-      // Identify beforeState and afterState for changed fields
-      const beforeState = {};
-      const afterState = {};
-      Object.entries(updates).forEach(([key, value]) => {
-        const colIndex = validColumns.findIndex((header) => header.toLowerCase() === key.toLowerCase());
-        if (colIndex !== -1 && restrictedRows[discordIdRowIndex][colIndex] !== value) {
-          beforeState[key] = restrictedRows[discordIdRowIndex][colIndex];
-          afterState[key] = value;
-          restrictedRows[discordIdRowIndex][colIndex] = value; // Apply the update
-        }
-      });
-
-      if (userId) {
-        restrictedRows[discordIdRowIndex][0] = userId; // Update name
-      }
-
-      const lastUpdateColIndex = validColumns.findIndex((col) => col.toLowerCase() === 'last_update');
-      restrictedRows[discordIdRowIndex][lastUpdateColIndex] = timestamp; // Update last_update column
-      
-      for (const [col, value] of Object.entries(updates)) {
-        const colIndex = validColumns.findIndex((header) => header.toLowerCase() === col.toLowerCase());
-        if (colIndex !== -1) restrictedRows[discordIdRowIndex][colIndex] = value;
-      }
-
-      // Identify beforeState and afterState for changed fields
-
-      log('info', `[UPDATE SUCCESS] Data updated`, {
-        executor: { userDisplayName, discord_id: userDiscordId, username: interaction.user.username },
-        target: { name: userId, discord_id: discordIdOption },
-        command: { name: commandName },
-        options: updates,
-        before: beforeState,
-        after: afterState,
-      });
-
-      await interaction.reply(`Updated data for member: ${userId}, by: ${userDisplayName}`);
-    } else {
-      const rowIndex = restrictedRows.findIndex((row) => row[0]?.toLowerCase() === userId.toLowerCase());
-
-      if (rowIndex === -1) {
-        const newRow = Array(validColumns.length).fill('');
-        newRow[0] = userId;
-        newRow[validColumns.findIndex((col) => col.toLowerCase() === 'discord_id')] = userDiscordId;
-        newRow[validColumns.findIndex((col) => col.toLowerCase() === 'display_name')] = userDisplayName;
-        newRow[validColumns.findIndex((col) => col.toLowerCase() === 'last_update')] = timestamp;
-
-        for (const [col, value] of Object.entries(updates)) {
-          const colIndex = validColumns.findIndex((header) => header.toLowerCase() === col.toLowerCase());
-          if (colIndex !== -1) newRow[colIndex] = value;
-        }
-
-        const firstEmptyRowIndex = restrictedRows.findIndex(row => row.every(cell => !cell || !cell.trim()));
-        const targetIndex = firstEmptyRowIndex === -1 ? restrictedRows.length : firstEmptyRowIndex;
-    
-        restrictedRows[targetIndex] = restrictedRows[targetIndex] || Array(validColumns.length).fill('');
-        restrictedRows[targetIndex] = newRow; // Assign the new data
-
-        log('info', `[ADD SUCCESS] Data added`, {
-          executor: { discord_id: userDiscordId, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-          target: { name: userId, discord_id: userDiscordId },
-          command: { name: commandName },
-          options: updates,
-        });
-
-        await interaction.reply(`Added new data for Member: ${userId}`);
-      } else {
-        const currentDiscordId = restrictedRows[rowIndex][validColumns.findIndex((col) => col.toLowerCase() === 'discord_id')];
-        const currentName = restrictedRows[rowIndex][0];
-
-        if (currentDiscordId === userDiscordId) {
-          const lastUpdateColIndex = validColumns.findIndex((col) => col.toLowerCase() === 'last_update');
-          const displayNameColIndex = validColumns.findIndex((col) => col.toLowerCase() === 'display_name');
-          restrictedRows[rowIndex][lastUpdateColIndex] = timestamp; // Update last_update column
-          restrictedRows[rowIndex][displayNameColIndex] = userDisplayName; // Update display_name column
+          if (targetRowIndex === -1) {
+            log('warn', `[UPDATE FAILED] Discord ID not found`, {
+              executor: { discord_id: userDiscordId, username: userDiscordUsername, display_name: interaction.user.tag, userDisplayName },
+              target: { discord_id: discordIdOption },
+              command: { name: commandName },
+              options: { name: memberName, points: pointsValue },
+            });
+            await interaction.reply(`No member found with Discord ID: ${discordIdOption}`);
+            return;
+          }
+          
+          // Track changes for logging
           const beforeState = {};
           const afterState = {};
-
-          Object.entries(updates).forEach(([key, value]) => {
-            const colIndex = validColumns.findIndex((header) => header.toLowerCase() === key.toLowerCase());
-            if (colIndex !== -1 && restrictedRows[rowIndex][colIndex] !== value) {
-              beforeState[key] = restrictedRows[rowIndex][colIndex];
-              afterState[key] = value;
-              restrictedRows[rowIndex][colIndex] = value; // Apply the update
+          
+          // Update name if provided
+          const nameIndex = getColumnIndex(SHEET_COLUMNS.NAME);
+          if (rows[targetRowIndex][nameIndex] !== memberName) {
+            beforeState.name = rows[targetRowIndex][nameIndex];
+            afterState.name = memberName;
+            rows[targetRondex][nameIndex] = memberName;
+          }
+          
+          // Update points if provided
+          if (pointsValue !== null) {
+            const pointsIndex = getColumnIndex(SHEET_COLUMNS.POINTS);
+            const currentPoints = rows[targetRowIndex][pointsIndex];
+            if (currentPoints !== pointsValue.toString()) {
+              beforeState.points = currentPoints;
+              afterState.points = pointsValue.toString();
+              rows[targetRowIndex][pointsIndex] = pointsValue.toString();
             }
-          });
+          }
 
-          log('info', `[UPDATE SUCCESS] Data updated by same user`, {
-            executor: { discord_id: userDiscordId, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-            target: { name: currentName, discord_id: currentDiscordId },
+          // Update last_update timestamp
+          rows[targetRowIndex][getColumnIndex(SHEET_COLUMNS.LAST_UPDATE)] = timestamp;
+
+          log('info', `[UPDATE SUCCESS] Data updated by allowed role`, {
+            executor: { userDisplayName, discord_id: userDiscordId, username: userDiscordUsername },
+            target: { name: memberName, discord_id: discordIdOption },
             command: { name: commandName },
-            options: updates,
+            options: { name: memberName, points: pointsValue },
             before: beforeState,
             after: afterState,
           });
 
-          await interaction.reply(`Updated data for Member: ${currentName}`);
+          await interaction.reply(`Updated data for member: ${memberName}, by: ${userDisplayName}`);
         } else {
-          log('warn', `[UPDATE FAILED] Unauthorized update attempt`, {
-            executor: { discord_id: userDiscordId, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-            target: { name: currentName, discord_id: currentDiscordId },
-            command: { name: commandName },
-            options: updates,
-          });
-          await interaction.reply('You do not have permission to update this member\'s data.');
+          // Update own data or create new entry
+          const existingRowIndex = rows.findIndex((row, index) => 
+            index > 0 && row[getColumnIndex(SHEET_COLUMNS.NAME)]?.toLowerCase() === memberName.toLowerCase()
+          );
+
+          if (existingRowIndex === -1) {
+            // Create new member entry
+            const newRow = Array(COLUMN_ORDER.length).fill('');
+            newRow[getColumnIndex(SHEET_COLUMNS.NAME)] = memberName;
+            newRow[getColumnIndex(SHEET_COLUMNS.DISPLAY_NAME)] = userDisplayName;
+            newRow[getColumnIndex(SHEET_COLUMNS.DISCORD_USERNAME)] = userDiscordUsername;
+            newRow[getColumnIndex(SHEET_COLUMNS.DISCORD_ID)] = userDiscordId;
+            newRow[getColumnIndex(SHEET_COLUMNS.POINTS)] = pointsValue ? pointsValue.toString() : '0';
+            newRow[getColumnIndex(SHEET_COLUMNS.LAST_UPDATE)] = timestamp;
+
+            rows.push(newRow);
+
+            log('info', `[ADD SUCCESS] New member added`, {
+              executor: { discord_id: userDiscordId, username: userDiscordUsername, display_name: interaction.user.tag, userDisplayName },
+              target: { name: memberName, discord_id: userDiscordId },
+              command: { name: commandName },
+              options: { name: memberName, points: pointsValue },
+            });
+
+            await interaction.reply(`Added new member: ${memberName}`);
+          } else {
+            // Update existing member - check if it's the same user
+            const currentDiscordId = rows[existingRowIndex][getColumnIndex(SHEET_COLUMNS.DISCORD_ID)];
+            const currentName = rows[existingRowIndex][getColumnIndex(SHEET_COLUMNS.NAME)];
+
+            if (currentDiscordId === userDiscordId) {
+              // User is updating their own data
+              const beforeState = {};
+              const afterState = {};
+
+              // Update display name and username
+              rows[existingRowIndex][getColumnIndex(SHEET_COLUMNS.DISPLAY_NAME)] = userDisplayName;
+              rows[existingRowIndex][getColumnIndex(SHEET_COLUMNS.DISCORD_USERNAME)] = userDiscordUsername;
+              
+              // Update points if provided
+              if (pointsValue !== null) {
+                const pointsIndex = getColumnIndex(SHEET_COLUMNS.POINTS);
+                const currentPoints = rows[existingRowIndex][pointsIndex];
+                if (currentPoints !== pointsValue.toString()) {
+                  beforeState.points = currentPoints;
+                  afterState.points = pointsValue.toString();
+                  rows[existingRowIndex][pointsIndex] = pointsValue.toString();
+                }
+              }
+
+              // Update timestamp
+              rows[existingRowIndex][getColumnIndex(SHEET_COLUMNS.LAST_UPDATE)] = timestamp;
+
+              log('info', `[UPDATE SUCCESS] Member updated own data`, {
+                executor: { discord_id: userDiscordId, username: userDiscordUsername, display_name: interaction.user.tag, userDisplayName },
+                target: { name: currentName, discord_id: currentDiscordId },
+                command: { name: commandName },
+                options: { name: memberName, points: pointsValue },
+                before: beforeState,
+                after: afterState,
+              });
+
+              await interaction.reply(`Updated data for: ${currentName}`);
+            } else {
+              // User trying to update someone else's data without permission
+              log('warn', `[UPDATE FAILED] Unauthorized update attempt`, {
+                executor: { discord_id: userDiscordId, username: userDiscordUsername, display_name: interaction.user.tag, userDisplayName },
+                target: { name: currentName, discord_id: currentDiscordId },
+                command: { name: commandName },
+                options: { name: memberName, points: pointsValue },
+              });
+              await interaction.reply('You do not have permission to update this member\'s data.');
+              return;
+            }
+          }
         }
+
+        await writeSheetData(sheets, rows);
+      } catch (error) {
+        log('error', 'Error handling member-update command', {
+          executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName: interaction.member?.displayName },
+          error: error.message,
+        });
+        await interaction.reply('An error occurred while processing your update command.');
       }
     }
 
-    await writeSheetData(sheets, restrictedRows);
-  } catch (error) {
-    log('error', 'Error handling artisan-update command', {
-      executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-      error: error.message,
-    });
-    await interaction.reply('An error occurred while processing your update command.');
-  }
-}
-    if (commandName === 'artisan-search') {
-      const searchFor = capitalize(options.getString('search_for'));
-      const columnsInput = options.getString('columns').toLowerCase();
-      const level = options.getString('level') ? capitalize(options.getString('level')) : null;
-      const userDisplayName = interaction.member.displayName;
+    // Handle member-search command
+    if (commandName === 'member-search') {
+      try {
+        const searchFor = options.getString('search_for').toLowerCase();
+        const userDisplayName = interaction.member.displayName;
 
-      let colIndexes;
-  
-      // Here we are determining which columns to search
-      if (columnsInput === 'any') {
-          colIndexes = validColumnsearch.map((_, index) => index); // This search all columns
-      } else {
-          const columns = columnsInput.split(',').map((col) => col.trim());
-          colIndexes = columns.map((col) => validColumnsearch.findIndex((header) => header.toLowerCase() === col.toLowerCase()));
-          if (colIndexes.includes(-1)) {
-            log('warn', `[SEARCH FAILED] Invalid columns specified`, {
-              executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-              command: { name: commandName },
-              options: { search_for: searchFor, columns: columnsInput, level },
-            });
-            await interaction.reply('One or more specified columns are invalid, Search_for is for Name/Profession/Expertise, Level is for only Expertise.');
-            return;
-          }
-      }
-  
-      // Here we filter the search based on search_for and level value
-      const filteredRows = restrictedRows.filter((row) => {
-          for (const colIndex of colIndexes) {
-              if (row[colIndex]?.toLowerCase() === searchFor.toLowerCase()) {
-                  // If level is provided, check corresponding level column
-                  if (level) {
-                      const levelColumnIndex = validColumnsearch.findIndex(
-                          (header) => header.toLowerCase() === `level_${validColumnsearch[colIndex].split('_')[1]}`
-                      );
-                      if (levelColumnIndex !== -1 && row[levelColumnIndex]?.toLowerCase() === level.toLowerCase()) {
-                          return true; // This match both profession and level according to _1, _2, _3, _4, _5
-                      }
-                  } else {
-                      return true; // Match profession only
-                  }
-              }
-          }
-          return false; // No match in the specified columns
-      });
-  
-      if (filteredRows.length === 0) {
-        log('info', `[SEARCH EMPTY] No results found`, {
+        let filteredRows;
+        
+        if (searchFor === 'all') {
+          // Show all members (excluding header row)
+          filteredRows = rows.slice(1);
+        } else {
+          // Search for specific member by name
+          filteredRows = rows.slice(1).filter((row) => 
+            row[getColumnIndex(SHEET_COLUMNS.NAME)]?.toLowerCase().includes(searchFor)
+          );
+        }
+
+        if (filteredRows.length === 0) {
+          log('info', `[SEARCH EMPTY] No results found`, {
+            executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
+            command: { name: commandName },
+            options: { search_for: searchFor },
+          });
+          await interaction.reply(`No members found matching: ${searchFor}`);
+          return;
+        }
+
+        // Generate and send the table image
+        const fileName = 'members_table.png';
+        await generateTableImage(headers, filteredRows, fileName);
+        
+        log('info', `[SEARCH SUCCESS] Results found`, {
           executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
           command: { name: commandName },
-          options: { search_for: searchFor, columns: columnsInput, level },
+          options: { search_for: searchFor },
+          results: { count: filteredRows.length },
         });
-        await interaction.reply(`No data matches for: ${searchFor}, in ${columnsInput} column, for the level ${level} `);
-        return;
+        
+        const resultText = searchFor === 'all' ? 'All members:' : `Search results for "${searchFor}":`;
+        await interaction.reply({ content: resultText, files: [fileName] });
+        fs.unlinkSync(fileName);
+      } catch (error) {
+        log('error', 'Error handling member-search command', {
+          executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName: interaction.member?.displayName },
+          error: error.message,
+        });
+        await interaction.reply('An error occurred while processing your search command.');
       }
-  
-      // Generate and send the table image
-      const fileName = 'filtered_table.png';
-      await generateTableImage(validColumnsearch, filteredRows, fileName);
-      log('info', `[SEARCH SUCCESS] Results found`, {
-        executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-        command: { name: commandName },
-        options: { search_for: searchFor, columns: columnsInput, level },
-        results: { count: filteredRows.length },
-      });
-      await interaction.reply({ content: 'Filtered data:', files: [fileName] });
-      fs.unlinkSync(fileName);
-  }
+    }
  
   } catch (error) {
-    log('error', 'Error handling artisan-search command', {
-      executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
+    log('error', 'Error handling command', {
+      executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag },
       error: error.message,
     });
     await interaction.reply('An error occurred while processing your command.');
   }
 });
 
-// Handle /artisan-logs command
+// Handle member-logs command
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isCommand()) return;
 
   const { commandName, options } = interaction;
 
-  if (commandName === 'artisan-logs') {
-  try {
-    const action = options.getString('action');
-    const lines = options.getInteger('lines') || 10;
-    const date = options.getString('date') || moment().format('YYYY-MM-DD');
-    const memberRoles = interaction.member.roles.cache.map((role) => role.name);
-    const userDisplayName = interaction.member.displayName;
+  if (commandName === 'member-logs') {
+    try {
+      const action = options.getString('action');
+      const lines = options.getInteger('lines') || 10;
+      const date = options.getString('date') || moment().format('YYYY-MM-DD');
+      const memberRoles = interaction.member.roles.cache.map((role) => role.name);
+      const userDisplayName = interaction.member.displayName;
 
-    if (!ALLOWED_ROLES.some((role) => memberRoles.includes(role))) {
-      log('warn', `[LOGS FAILED] Unauthorized access attempt`, {
-        executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-        command: { name: commandName },
-        options: { action, lines, date },
-      });
-      await interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
-      return;
-    }
-
-    const logFilePath = path.resolve(__dirname, `logs/bot-${date}.log`);
-
-    if (action === 'view') {
-      if (!fs.existsSync(logFilePath)) {
-        log('warn', `[LOGS VIEW FAILED] File not found`, {
+      if (!ALLOWED_ROLES.some((role) => memberRoles.includes(role))) {
+        log('warn', `[LOGS FAILED] Unauthorized access attempt`, {
           executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
           command: { name: commandName },
           options: { action, lines, date },
         });
-        await interaction.reply({ content: `No log file found for the specified date: ${date}.`, ephemeral: true });
+        await interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
         return;
       }
 
-      const logData = fs.readFileSync(logFilePath, 'utf8').split('\n').slice(-lines).join('\n');
-      const content = `\`\`\`log\n${logData}\n\`\`\``;
+      const logFilePath = path.resolve(__dirname, `logs/bot-${date}.log`);
 
-      if (content.length > 2000) {
-        await interaction.reply({ content: 'Log data is too large to display. Use the "Download" option.', ephemeral: true });
-      } else {
-        await interaction.reply({ content, ephemeral: true });
-      }
+      if (action === 'view') {
+        if (!fs.existsSync(logFilePath)) {
+          log('warn', `[LOGS VIEW FAILED] File not found`, {
+            executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
+            command: { name: commandName },
+            options: { action, lines, date },
+          });
+          await interaction.reply({ content: `No log file found for the specified date: ${date}.`, ephemeral: true });
+          return;
+        }
 
-      log('info', `[LOGS VIEW SUCCESS] Logs viewed`, {
-        executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-        command: { name: commandName },
-        options: { action, lines, date },
-      });
-    } else if (action === 'download') {
-      if (!fs.existsSync(logFilePath)) {
-        log('warn', `[LOGS DOWNLOAD FAILED] File not found`, {
+        const logData = fs.readFileSync(logFilePath, 'utf8').split('\n').slice(-lines).join('\n');
+        const content = `\`\`\`log\n${logData}\n\`\`\``;
+
+        if (content.length > 2000) {
+          await interaction.reply({ content: 'Log data is too large to display. Use the "Download" option.', ephemeral: true });
+        } else {
+          await interaction.reply({ content, ephemeral: true });
+        }
+
+        log('info', `[LOGS VIEW SUCCESS] Logs viewed`, {
+          executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
+          command: { name: commandName },
+          options: { action, lines, date },
+        });
+      } else if (action === 'download') {
+        if (!fs.existsSync(logFilePath)) {
+          log('warn', `[LOGS DOWNLOAD FAILED] File not found`, {
+            executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
+            command: { name: commandName },
+            options: { action, date },
+          });
+          await interaction.reply({ content: `No log file found for the specified date: ${date}.`, ephemeral: true });
+          return;
+        }
+
+        await interaction.reply({ content: `Here are the logs for ${date}:`, files: [logFilePath], ephemeral: true });
+
+        log('info', `[LOGS DOWNLOAD SUCCESS] Logs downloaded`, {
           executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
           command: { name: commandName },
           options: { action, date },
         });
-        await interaction.reply({ content: `No log file found for the specified date: ${date}.`, ephemeral: true });
-        return;
+      } else if (action === 'clear') {
+        if (fs.existsSync(logFilePath)) {
+          fs.writeFileSync(logFilePath, '');
+          await interaction.reply({ content: `The logs for ${date} have been cleared successfully.`, ephemeral: true });
+
+          log('info', `[LOGS CLEAR SUCCESS] Logs cleared`, {
+            executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
+            command: { name: commandName },
+            options: { action, date },
+          });
+        } else {
+          log('warn', `[LOGS CLEAR FAILED] File not found`, {
+            executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
+            command: { name: commandName },
+            options: { action, date },
+          });
+          await interaction.reply({ content: `No log file found for the specified date: ${date}.`, ephemeral: true });
+        }
       }
-
-      await interaction.reply({ content: `Here are the logs for ${date}:`, files: [logFilePath], ephemeral: true });
-
-      log('info', `[LOGS DOWNLOAD SUCCESS] Logs downloaded`, {
-        executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-        command: { name: commandName },
-        options: { action, date },
-      });
-    } else if (action === 'clear') {
-      if (fs.existsSync(logFilePath)) {
-        fs.writeFileSync(logFilePath, '');
-        await interaction.reply({ content: `The logs for ${date} have been cleared successfully.`, ephemeral: true });
-
-        log('info', `[LOGS CLEAR SUCCESS] Logs cleared`, {
-          executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-          command: { name: commandName },
-          options: { action, date },
-        });
-      } else {
-        log('warn', `[LOGS CLEAR FAILED] File not found`, {
-          executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-          command: { name: commandName },
-          options: { action, date },
-        });
-        await interaction.reply({ content: `No log file found for the specified date: ${date}.`, ephemeral: true });
-      }
-    }
     } catch (error) {
-    log('error', 'Error handling artisan-logs command', {
-      executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName },
-      error: error.message,
-    });
-    await interaction.reply({ content: 'An error occurred while processing your logs command.', ephemeral: true });
+      log('error', 'Error handling member-logs command', {
+        executor: { discord_id: interaction.user.id, username: interaction.user.username, display_name: interaction.user.tag, userDisplayName: interaction.member?.displayName },
+        error: error.message,
+      });
+      await interaction.reply({ content: 'An error occurred while processing your logs command.', ephemeral: true });
+    }
   }
-}
 });
 
 client.on('ready', () => {

@@ -34,16 +34,18 @@ const CONFIG = {
 // Define the spreadsheet columns structure - modify this to change columns
 const SHEET_COLUMNS = {
   NAME: 'Name',
-  DISPLAY_NAME: 'Display_Name',
-  DISCORD_USERNAME: 'Discord_Username',
-  DISCORD_ID: 'Discord_ID',
+  DISPLAY_NAME: 'Display Name',
+  DISCORD_USERNAME: 'Discord Username',
+  DISCORD_ID: 'Discord ID',
   POINTS: 'Points',
-  LAST_UPDATE: 'Last_Update'
+  LAST_UPDATE: 'Last Update',
+  ANONYMOUS: 'Anonymous?'
 };
 
 // Define the order of columns in the spreadsheet (left to right)
 const COLUMN_ORDER = [
   SHEET_COLUMNS.NAME,
+  SHEET_COLUMNS.ANONYMOUS,
   SHEET_COLUMNS.DISPLAY_NAME,
   SHEET_COLUMNS.DISCORD_USERNAME,
   SHEET_COLUMNS.DISCORD_ID,
@@ -73,6 +75,21 @@ function capitalize(value) {
 
 function getCurrentTimestamp() {
   return moment().tz(CONFIG.TIMEZONE).format('YYYY-MM-DD HH:mm:ss');
+}
+
+function getExecutorUsername(interaction) {
+  return interaction.member?.displayName || interaction.user?.username || "Unknown";
+}
+
+function checkPermissions(interaction) {
+  const memberRoles = interaction.member?.roles?.cache?.map((role) => role.name) || [];
+  return CONFIG.DISCORD.ALLOWED_ROLES.some((role) => memberRoles.includes(role));
+}
+
+function isAnonymous(anonymousValue) {
+  if (!anonymousValue || typeof anonymousValue !== 'string') return true;
+  const value = anonymousValue.toLowerCase().trim();
+  return !(value === 'false' || value === 'no');
 }
 
 // ============================================================================
@@ -107,7 +124,8 @@ class Logger {
           const options = meta.options ? ` | Options: ${JSON.stringify(meta.options)}` : '';
           const before = meta.before ? ` | Before: ${JSON.stringify(meta.before)}` : '';
           const after = meta.after ? ` | After: ${JSON.stringify(meta.after)}` : '';
-          return `${timestamp} [${level.toUpperCase()}] ${message}${executor}${target}${command}${options}${before}${after}`;
+          const results = meta.results ? ` | Results: ${JSON.stringify(meta.results)}` : '';
+          return `${timestamp} [${level.toUpperCase()}] ${message}${executor}${target}${command}${options}${before}${after}${results}`;
         })
       ),
       transports: [
@@ -211,22 +229,7 @@ class GoogleSheetsService {
 // TABLE IMAGE GENERATOR
 // ============================================================================
 class TableImageGenerator {
-  static async generateImage(headers, data, fileName = 'table.png') {
-    // Format the data for better display
-    const formattedData = data.map(row => {
-      return row.map((cell, index) => {
-        // Add commas to numbers in the Points column
-        if (headers[index] === 'Points' && !isNaN(cell)) {
-          return Number(cell).toLocaleString();
-        }
-        // Format timestamps in Last_Update column
-        if (headers[index] === 'Last_Update' && cell) {
-          return moment(cell).format('MM/DD/YY HH:mm');
-        }
-        return cell || '';
-      });
-    });
-
+  static async generateLeaderboardImage(data, fileName = 'leaderboard.png') {
     const html = `
       <!DOCTYPE html>
       <html>
@@ -245,17 +248,24 @@ class TableImageGenerator {
               padding: 20px;
               margin: 0 auto;
             }
+            .title {
+              text-align: center;
+              font-size: 24px;
+              font-weight: bold;
+              color: #333;
+              margin-bottom: 20px;
+            }
             table {
               border-collapse: separate;
               border-spacing: 0;
               width: 100%;
               margin: 0 auto;
-              font-size: 14px;
+              font-size: 16px;
               border-radius: 8px;
               overflow: hidden;
             }
             th, td {
-              padding: 12px 15px;
+              padding: 15px 20px;
               text-align: left;
               border-bottom: 1px solid #e9ecef;
             }
@@ -277,28 +287,39 @@ class TableImageGenerator {
             td {
               color: #333;
             }
-            .row-number {
+            .rank {
               color: #666;
-              font-size: 12px;
+              font-weight: bold;
               text-align: center;
-              width: 40px;
+              width: 60px;
+            }
+            .points {
+              font-weight: bold;
+              text-align: right;
+              width: 120px;
+            }
+            .name {
+              font-weight: 500;
             }
           </style>
         </head>
         <body>
           <div class="container">
+            <div class="title">🏆 Leaderboard - Top 15 🏆</div>
             <table>
               <thead>
                 <tr>
-                  <th class="row-number">#</th>
-                  ${headers.map(header => `<th>${header.replace('_', ' ')}</th>`).join('')}
+                  <th class="rank">Rank</th>
+                  <th class="name">Name</th>
+                  <th class="points">Points</th>
                 </tr>
               </thead>
               <tbody>
-                ${formattedData.map((row, index) => `
+                ${data.map((row, index) => `
                   <tr>
-                    <td class="row-number">${index + 1}</td>
-                    ${row.map(cell => `<td>${cell}</td>`).join('')}
+                    <td class="rank">${index + 1}</td>
+                    <td class="name">${row.name}</td>
+                    <td class="points">${Number(row.points).toLocaleString()}</td>
                   </tr>
                 `).join('')}
               </tbody>
@@ -319,7 +340,7 @@ class TableImageGenerator {
       await page.setContent(html);
       
       // Set viewport to a large size initially to ensure content fits
-      await page.setViewport({ width: 1200, height: 800 });
+      await page.setViewport({ width: 800, height: 600 });
       
       // Get the container element that wraps the table
       const containerHandle = await page.$('.container');
@@ -343,9 +364,9 @@ class TableImageGenerator {
         }
       });
       
-      logger.info('Table image generated successfully', { fileName });
+      logger.info('Leaderboard image generated successfully', { fileName });
     } catch (error) {
-      logger.error('Failed to generate table image', { error: error.message, fileName });
+      logger.error('Failed to generate leaderboard image', { error: error.message, fileName });
       throw error;
     } finally {
       if (browser) {
@@ -363,248 +384,117 @@ class CommandHandlers {
     this.sheetsService = sheetsService;
   }
 
-  async handleMemberUpdate(interaction) {
+  async handleViewLeaderboard(interaction) {
     try {
-      const memberName = capitalize(interaction.options.getString('name'));
-      const userDiscordId = interaction.user.id;
-      const userDisplayName = interaction.member.displayName;
-      const userDiscordUsername = interaction.user.username;
-      const discordIdOption = interaction.options.getString('discord_id');
-      const pointsValue = interaction.options.getInteger('points');
-      const timestamp = getCurrentTimestamp();
+      const userDisplayName = getExecutorUsername(interaction);
       
-      const isAllowedRole = CONFIG.DISCORD.ALLOWED_ROLES.some((role) => 
-        interaction.member.roles.cache.some((r) => r.name === role)
-      );
-
-      const rows = await this.sheetsService.fetchSheetData();
-      
-      // Handle updating another member (requires allowed role)
-      if (discordIdOption && isAllowedRole) {
-        await this.updateOtherMember(interaction, rows, {
-          memberName, userDiscordId, userDisplayName, userDiscordUsername,
-          discordIdOption, pointsValue, timestamp
+      // Check permissions
+      if (!checkPermissions(interaction)) {
+        logger.warn('[LEADERBOARD FAILED] Unauthorized access attempt', {
+          executor: { 
+            discord_id: interaction.user.id, 
+            username: interaction.user.username,
+            userDisplayName 
+          },
+          command: { name: 'view-leaderboard' },
         });
-      } else {
-        // Handle self-update or new member creation
-        await this.updateSelfOrCreate(interaction, rows, {
-          memberName, userDiscordId, userDisplayName, userDiscordUsername,
-          pointsValue, timestamp
-        });
-      }
-
-      await this.sheetsService.writeSheetData(rows);
-    } catch (error) {
-      logger.error('Error handling member-update command', {
-        executor: { 
-          discord_id: interaction.user.id, 
-          username: interaction.user.username,
-          userDisplayName: interaction.member?.displayName 
-        },
-        error: error.message,
-      });
-      await interaction.reply('An error occurred while processing your update command.');
-    }
-  }
-
-  async updateOtherMember(interaction, rows, params) {
-    const { memberName, userDiscordId, userDisplayName, userDiscordUsername,
-            discordIdOption, pointsValue, timestamp } = params;
-    
-    const targetRowIndex = rows.findIndex((row, index) => 
-      index > 0 && row[getColumnIndex(SHEET_COLUMNS.DISCORD_ID)] === discordIdOption
-    );
-
-    if (targetRowIndex === -1) {
-      logger.warn('[UPDATE FAILED] Discord ID not found', {
-        executor: { discord_id: userDiscordId, username: userDiscordUsername, userDisplayName },
-        target: { discord_id: discordIdOption },
-        command: { name: 'member-update' },
-        options: { name: memberName, points: pointsValue },
-      });
-      await interaction.reply(`No member found with Discord ID: ${discordIdOption}`);
-      return;
-    }
-    
-    const beforeState = {};
-    const afterState = {};
-    
-    // Update name
-    const nameIndex = getColumnIndex(SHEET_COLUMNS.NAME);
-    if (rows[targetRowIndex][nameIndex] !== memberName) {
-      beforeState.name = rows[targetRowIndex][nameIndex];
-      afterState.name = memberName;
-      rows[targetRowIndex][nameIndex] = memberName;
-    }
-    
-    // Update points if provided
-    if (pointsValue !== null) {
-      const pointsIndex = getColumnIndex(SHEET_COLUMNS.POINTS);
-      const currentPoints = rows[targetRowIndex][pointsIndex];
-      if (currentPoints !== pointsValue.toString()) {
-        beforeState.points = currentPoints;
-        afterState.points = pointsValue.toString();
-        rows[targetRowIndex][pointsIndex] = pointsValue.toString();
-      }
-    }
-
-    rows[targetRowIndex][getColumnIndex(SHEET_COLUMNS.LAST_UPDATE)] = timestamp;
-
-    logger.info('[UPDATE SUCCESS] Data updated by allowed role', {
-      executor: { userDisplayName, discord_id: userDiscordId, username: userDiscordUsername },
-      target: { name: memberName, discord_id: discordIdOption },
-      command: { name: 'member-update' },
-      options: { name: memberName, points: pointsValue },
-      before: beforeState,
-      after: afterState,
-    });
-
-    await interaction.reply(`Updated data for member: ${memberName}, by: ${userDisplayName}`);
-  }
-
-  async updateSelfOrCreate(interaction, rows, params) {
-    const { memberName, userDiscordId, userDisplayName, userDiscordUsername,
-            pointsValue, timestamp } = params;
-    
-    const existingRowIndex = rows.findIndex((row, index) => 
-      index > 0 && row[getColumnIndex(SHEET_COLUMNS.NAME)]?.toLowerCase() === memberName.toLowerCase()
-    );
-
-    if (existingRowIndex === -1) {
-      // Create new member
-      const newRow = Array(COLUMN_ORDER.length).fill('');
-      newRow[getColumnIndex(SHEET_COLUMNS.NAME)] = memberName;
-      newRow[getColumnIndex(SHEET_COLUMNS.DISPLAY_NAME)] = userDisplayName;
-      newRow[getColumnIndex(SHEET_COLUMNS.DISCORD_USERNAME)] = userDiscordUsername;
-      newRow[getColumnIndex(SHEET_COLUMNS.DISCORD_ID)] = userDiscordId;
-      newRow[getColumnIndex(SHEET_COLUMNS.POINTS)] = pointsValue ? pointsValue.toString() : '0';
-      newRow[getColumnIndex(SHEET_COLUMNS.LAST_UPDATE)] = timestamp;
-
-      rows.push(newRow);
-
-      logger.info('[ADD SUCCESS] New member added', {
-        executor: { discord_id: userDiscordId, username: userDiscordUsername, userDisplayName },
-        target: { name: memberName, discord_id: userDiscordId },
-        command: { name: 'member-update' },
-        options: { name: memberName, points: pointsValue },
-      });
-
-      await interaction.reply(`Added new member: ${memberName}`);
-    } else {
-      // Update existing member
-      const currentDiscordId = rows[existingRowIndex][getColumnIndex(SHEET_COLUMNS.DISCORD_ID)];
-      const currentName = rows[existingRowIndex][getColumnIndex(SHEET_COLUMNS.NAME)];
-
-      if (currentDiscordId === userDiscordId) {
-        const beforeState = {};
-        const afterState = {};
-
-        rows[existingRowIndex][getColumnIndex(SHEET_COLUMNS.DISPLAY_NAME)] = userDisplayName;
-        rows[existingRowIndex][getColumnIndex(SHEET_COLUMNS.DISCORD_USERNAME)] = userDiscordUsername;
-        
-        if (pointsValue !== null) {
-          const pointsIndex = getColumnIndex(SHEET_COLUMNS.POINTS);
-          const currentPoints = rows[existingRowIndex][pointsIndex];
-          if (currentPoints !== pointsValue.toString()) {
-            beforeState.points = currentPoints;
-            afterState.points = pointsValue.toString();
-            rows[existingRowIndex][pointsIndex] = pointsValue.toString();
-          }
-        }
-
-        rows[existingRowIndex][getColumnIndex(SHEET_COLUMNS.LAST_UPDATE)] = timestamp;
-
-        logger.info('[UPDATE SUCCESS] Member updated own data', {
-          executor: { discord_id: userDiscordId, username: userDiscordUsername, userDisplayName },
-          target: { name: currentName, discord_id: currentDiscordId },
-          command: { name: 'member-update' },
-          options: { name: memberName, points: pointsValue },
-          before: beforeState,
-          after: afterState,
-        });
-
-        await interaction.reply(`Updated data for: ${currentName}`);
-      } else {
-        logger.warn('[UPDATE FAILED] Unauthorized update attempt', {
-          executor: { discord_id: userDiscordId, username: userDiscordUsername, userDisplayName },
-          target: { name: currentName, discord_id: currentDiscordId },
-          command: { name: 'member-update' },
-          options: { name: memberName, points: pointsValue },
-        });
-        await interaction.reply('You do not have permission to update this member\'s data.');
-      }
-    }
-  }
-
-  async handleMemberSearch(interaction) {
-    try {
-      const searchFor = interaction.options.getString('search_for').toLowerCase();
-      const userDisplayName = interaction.member.displayName;
-      const rows = await this.sheetsService.fetchSheetData();
-      const headers = rows[0];
-
-      let filteredRows;
-      
-      if (searchFor === 'all') {
-        filteredRows = rows.slice(1);
-      } else {
-        filteredRows = rows.slice(1).filter((row) => 
-          row[getColumnIndex(SHEET_COLUMNS.NAME)]?.toLowerCase().includes(searchFor)
-        );
-      }
-
-      if (filteredRows.length === 0) {
-        logger.info('[SEARCH EMPTY] No results found', {
-          executor: { discord_id: interaction.user.id, username: interaction.user.username, userDisplayName },
-          command: { name: 'member-search' },
-          options: { search_for: searchFor },
-        });
-        await interaction.reply(`No members found matching: ${searchFor}`);
+        await interaction.reply({ content: 'You do not have permission to use this command.', flags: ['Ephemeral'] });
         return;
       }
 
-      const fileName = 'members_table.png';
-      await TableImageGenerator.generateImage(headers, filteredRows, fileName);
+      const rows = await this.sheetsService.fetchSheetData();
       
-      logger.info('[SEARCH SUCCESS] Results found', {
-        executor: { discord_id: interaction.user.id, username: interaction.user.username, userDisplayName },
-        command: { name: 'member-search' },
-        options: { search_for: searchFor },
-        results: { count: filteredRows.length },
+      if (rows.length <= 1) {
+        logger.info('[LEADERBOARD EMPTY] No data found', {
+          executor: { 
+            discord_id: interaction.user.id, 
+            username: interaction.user.username, 
+            userDisplayName 
+          },
+          command: { name: 'view-leaderboard' },
+        });
+        await interaction.reply('No leaderboard data available.');
+        return;
+      }
+
+      const headers = rows[0];
+      const nameIndex = getColumnIndex(SHEET_COLUMNS.NAME);
+      const pointsIndex = getColumnIndex(SHEET_COLUMNS.POINTS);
+      const anonymousIndex = getColumnIndex(SHEET_COLUMNS.ANONYMOUS);
+
+      // Process and sort data by points (descending)
+      const processedData = rows.slice(1)
+        .filter(row => row[pointsIndex] && !isNaN(row[pointsIndex])) // Only rows with valid points
+        .map(row => ({
+          name: isAnonymous(row[anonymousIndex]) ? 'Anonymous' : (row[nameIndex] || 'Unknown'),
+          points: parseInt(row[pointsIndex]) || 0,
+          originalName: row[nameIndex] || 'Unknown'
+        }))
+        .sort((a, b) => b.points - a.points)
+        .slice(0, 15); // Top 15
+
+      if (processedData.length === 0) {
+        logger.info('[LEADERBOARD EMPTY / INVALID] No valid data found', {
+          executor: { 
+            discord_id: interaction.user.id, 
+            username: interaction.user.username, 
+            userDisplayName 
+          },
+          command: { name: 'view-leaderboard' },
+        });
+        await interaction.reply('No valid leaderboard data available.');
+        return;
+      }
+
+      const fileName = 'leaderboard.png';
+      await TableImageGenerator.generateLeaderboardImage(processedData, fileName);
+      
+      logger.info('[LEADERBOARD SUCCESS] Leaderboard generated', {
+        executor: { 
+          discord_id: interaction.user.id, 
+          username: interaction.user.username, 
+          userDisplayName 
+        },
+        command: { name: 'view-leaderboard' },
+        results: { count: processedData.length },
       });
       
-      const resultText = searchFor === 'all' ? 'All members:' : `Search results for "${searchFor}":`;
-      await interaction.reply({ content: resultText, files: [fileName] });
+      await interaction.reply({ content: '🏆 **Current Leaderboard - Top 15** 🏆', files: [fileName] });
       
       // Clean up the generated file
       if (fs.existsSync(fileName)) {
         fs.unlinkSync(fileName);
       }
     } catch (error) {
-      logger.error('Error handling member-search command', {
+      logger.error('Error handling view-leaderboard command', {
         executor: { 
           discord_id: interaction.user.id, 
           username: interaction.user.username,
-          userDisplayName: interaction.member?.displayName 
+          userDisplayName: getExecutorUsername(interaction)
         },
+        command: { name: 'view-leaderboard' },
         error: error.message,
       });
-      await interaction.reply('An error occurred while processing your search command.');
+      await interaction.reply('An error occurred while generating the leaderboard.');
     }
   }
 
-  async handleMemberLogs(interaction) {
+  async handleMembershipLogs(interaction) {
     try {
       const action = interaction.options.getString('action');
       const lines = interaction.options.getInteger('lines') || 10;
       const date = interaction.options.getString('date') || moment().format('YYYY-MM-DD');
-      const memberRoles = interaction.member.roles.cache.map((role) => role.name);
-      const userDisplayName = interaction.member.displayName;
+      const userDisplayName = getExecutorUsername(interaction);
 
-      if (!CONFIG.DISCORD.ALLOWED_ROLES.some((role) => memberRoles.includes(role))) {
+      // Check permissions
+      if (!checkPermissions(interaction)) {
         logger.warn('[LOGS FAILED] Unauthorized access attempt', {
-          executor: { discord_id: interaction.user.id, username: interaction.user.username, userDisplayName },
-          command: { name: 'member-logs' },
+          executor: { 
+            discord_id: interaction.user.id, 
+            username: interaction.user.username, 
+            userDisplayName 
+          },
+          command: { name: 'membership-logs' },
           options: { action, lines, date },
         });
         await interaction.reply({ content: 'You do not have permission to use this command.', flags: ['Ephemeral'] });
@@ -615,35 +505,38 @@ class CommandHandlers {
 
       switch (action) {
         case 'view':
-          await this.handleLogView(interaction, logFilePath, lines, date);
+          await this.handleLogView(interaction, logFilePath, lines, date, userDisplayName);
           break;
         case 'download':
-          await this.handleLogDownload(interaction, logFilePath, date);
-          break;
-        case 'clear':
-          await this.handleLogClear(interaction, logFilePath, date);
+          await this.handleLogDownload(interaction, logFilePath, date, userDisplayName);
           break;
       }
     } catch (error) {
-      logger.error('Error handling member-logs command', {
+      logger.error('Error handling membership-logs command', {
         executor: { 
           discord_id: interaction.user.id, 
           username: interaction.user.username,
-          userDisplayName: interaction.member?.displayName 
+          userDisplayName: getExecutorUsername(interaction)
         },
+        command: { name: 'membership-logs' },
         error: error.message,
       });
-      await interaction.reply({ content: 'An error occurred while processing your logs command.', ephemeral: true });
+      await interaction.reply({ content: 'An error occurred while processing your logs command.', flags: ['Ephemeral'] });
     }
   }
 
-  async handleLogView(interaction, logFilePath, lines, date) {
+  async handleLogView(interaction, logFilePath, lines, date, userDisplayName) {
     if (!fs.existsSync(logFilePath)) {
       logger.warn('[LOGS VIEW FAILED] File not found', {
-        executor: { discord_id: interaction.user.id, username: interaction.user.username },
+        executor: { 
+          discord_id: interaction.user.id, 
+          username: interaction.user.username, 
+          userDisplayName 
+        },
+        command: { name: 'membership-logs' },
         options: { action: 'view', lines, date },
       });
-      await interaction.reply({ content: `No log file found for the specified date: ${date}.`, ephemeral: true });
+      await interaction.reply({ content: `No log file found for the specified date: ${date}.`, flags: ['Ephemeral'] });
       return;
     }
 
@@ -651,51 +544,48 @@ class CommandHandlers {
     const content = `\`\`\`log\n${logData}\n\`\`\``;
 
     if (content.length > 2000) {
-      await interaction.reply({ content: 'Log data is too large to display. Use the "Download" option.', ephemeral: true });
+      await interaction.reply({ content: 'Log data is too large to display. Use the "Download" option.', flags: ['Ephemeral'] });
     } else {
-      await interaction.reply({ content, ephemeral: true });
+      await interaction.reply({ content, flags: ['Ephemeral'] });
     }
 
     logger.info('[LOGS VIEW SUCCESS] Logs viewed', {
-      executor: { discord_id: interaction.user.id, username: interaction.user.username },
+      executor: { 
+        discord_id: interaction.user.id, 
+        username: interaction.user.username, 
+        userDisplayName 
+      },
+      command: { name: 'membership-logs' },
       options: { action: 'view', lines, date },
     });
   }
 
-  async handleLogDownload(interaction, logFilePath, date) {
+  async handleLogDownload(interaction, logFilePath, date, userDisplayName) {
     if (!fs.existsSync(logFilePath)) {
       logger.warn('[LOGS DOWNLOAD FAILED] File not found', {
-        executor: { discord_id: interaction.user.id, username: interaction.user.username },
+        executor: { 
+          discord_id: interaction.user.id, 
+          username: interaction.user.username, 
+          userDisplayName 
+        },
+        command: { name: 'membership-logs' },
         options: { action: 'download', date },
       });
-      await interaction.reply({ content: `No log file found for the specified date: ${date}.`, ephemeral: true });
+      await interaction.reply({ content: `No log file found for the specified date: ${date}.`, flags: ['Ephemeral'] });
       return;
     }
 
-    await interaction.reply({ content: `Here are the logs for ${date}:`, files: [logFilePath], ephemeral: true });
+    await interaction.reply({ content: `Here are the logs for ${date}:`, files: [logFilePath], flags: ['Ephemeral'] });
 
     logger.info('[LOGS DOWNLOAD SUCCESS] Logs downloaded', {
-      executor: { discord_id: interaction.user.id, username: interaction.user.username },
+      executor: { 
+        discord_id: interaction.user.id, 
+        username: interaction.user.username, 
+        userDisplayName 
+      },
+      command: { name: 'membership-logs' },
       options: { action: 'download', date },
     });
-  }
-
-  async handleLogClear(interaction, logFilePath, date) {
-    if (fs.existsSync(logFilePath)) {
-      fs.writeFileSync(logFilePath, '');
-      await interaction.reply({ content: `The logs for ${date} have been cleared successfully.`, ephemeral: true });
-
-      logger.info('[LOGS CLEAR SUCCESS] Logs cleared', {
-        executor: { discord_id: interaction.user.id, username: interaction.user.username },
-        options: { action: 'clear', date },
-      });
-    } else {
-      logger.warn('[LOGS CLEAR FAILED] File not found', {
-        executor: { discord_id: interaction.user.id, username: interaction.user.username },
-        options: { action: 'clear', date },
-      });
-      await interaction.reply({ content: `No log file found for the specified date: ${date}.`, ephemeral: true });
-    }
   }
 }
 
@@ -725,14 +615,11 @@ class DiscordBot {
 
       try {
         switch (commandName) {
-          case 'member-update':
-            await this.commandHandlers.handleMemberUpdate(interaction);
+          case 'view-leaderboard':
+            await this.commandHandlers.handleViewLeaderboard(interaction);
             break;
-          case 'member-search':
-            await this.commandHandlers.handleMemberSearch(interaction);
-            break;
-          case 'member-logs':
-            await this.commandHandlers.handleMemberLogs(interaction);
+          case 'membership-logs':
+            await this.commandHandlers.handleMembershipLogs(interaction);
             break;
           default:
             logger.warn('Unknown command received', { commandName });
@@ -742,7 +629,11 @@ class DiscordBot {
         logger.error('Error handling interaction', {
           commandName,
           error: error.message,
-          executor: { discord_id: interaction.user.id, username: interaction.user.username }
+          executor: { 
+            discord_id: interaction.user.id, 
+            username: interaction.user.username,
+            userDisplayName: getExecutorUsername(interaction)
+          }
         });
         
         if (!interaction.replied && !interaction.deferred) {
@@ -755,32 +646,35 @@ class DiscordBot {
   async registerCommands() {
     const commands = [
       {
-        name: 'member-update',
-        description: 'Add or update member data.',
-        options: [
-          { name: 'name', description: 'Member name (case-insensitive).', type: 3, required: true },
-          { name: 'points', description: 'Points to set for the member.', type: 4, required: false },
-          { name: 'discord_id', description: 'Discord ID of the member to update. Required for allowed roles to update another member.', type: 3, required: false },
-        ],
+        name: 'view-leaderboard',
+        description: 'View the current leaderboard showing top 15 members by points.',
       },
       {
-        name: 'member-search',
-        description: 'Search for members by name or view all members.',
+        name: 'membership-logs',
+        description: 'Manage logs (view or download). This is restricted to authorized roles.',
         options: [
-          { name: 'search_for', description: 'Member name to search for, or "all" to show all members.', type: 3, required: true },
-        ],
-      },
-      {
-        name: 'member-logs',
-        description: 'Manage logs (view, download or clear). This is restricted.',
-        options: [
-          { name: 'action', description: 'View, download, or clear logs', type: 3, required: true, choices: [
-            { name: 'View', value: 'view' },
-            { name: 'Download', value: 'download' },
-            { name: 'Clear', value: 'clear' },
-          ]},
-          { name: 'lines', description: 'Number of last lines to view (only works for "View" action)', type: 4, required: false },
-          { name: 'date', description: 'Specify a date (YYYY-MM-DD) for previous logs', type: 3, required: false },
+          { 
+            name: 'action', 
+            description: 'View or download logs', 
+            type: 3, 
+            required: true, 
+            choices: [
+              { name: 'View', value: 'view' },
+              { name: 'Download', value: 'download' },
+            ]
+          },
+          { 
+            name: 'lines', 
+            description: 'Number of last lines to view (only works for "View" action)', 
+            type: 4, 
+            required: false 
+          },
+          { 
+            name: 'date', 
+            description: 'Specify a date (YYYY-MM-DD) for previous logs', 
+            type: 3, 
+            required: false 
+          },
         ],
       },
     ];

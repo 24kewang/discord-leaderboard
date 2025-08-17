@@ -609,7 +609,7 @@ class DiscordBot {
     });
 
     this.client.on('interactionCreate', async (interaction) => {
-      if (!interaction.isCommand()) return;
+      if (!interaction.guild || !interaction.isCommand()) return;
 
       const { commandName } = interaction;
 

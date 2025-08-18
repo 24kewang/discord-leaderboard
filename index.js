@@ -447,7 +447,21 @@ class CommandHandlers {
       }
 
       const fileName = 'leaderboard.png';
-      await TableImageGenerator.generateLeaderboardImage(processedData, fileName);
+      let leaderboardText = '```\n🏆 LEADERBOARD - TOP 15 🏆\n\n';
+      leaderboardText += 'Rank | Name                    | Points\n';
+      leaderboardText += '-----|-------------------------|----------\n';
+      
+      processedData.forEach((row, index) => {
+        const rank = (index + 1).toString().padStart(2, ' ');
+        const name = row.name.padEnd(23, ' ').substring(0, 23);
+        const points = Number(row.points).toLocaleString().padStart(8, ' ');
+        leaderboardText += `${rank}   | ${name} | ${points}\n`;
+      });
+      
+      leaderboardText += '```';
+      
+      await interaction.reply(leaderboardText);
+      // await TableImageGenerator.generateLeaderboardImage(processedData, fileName);
       
       logger.info('[LEADERBOARD SUCCESS] Leaderboard generated', {
         executor: { 
@@ -459,12 +473,12 @@ class CommandHandlers {
         results: { count: processedData.length },
       });
       
-      await interaction.reply({ content: '🏆 **Current Leaderboard - Top 15** 🏆', files: [fileName] });
+      // await interaction.reply({ content: '🏆 **Current Leaderboard - Top 15** 🏆', files: [fileName] });
       
-      // Clean up the generated file
-      if (fs.existsSync(fileName)) {
-        fs.unlinkSync(fileName);
-      }
+      // // Clean up the generated file
+      // if (fs.existsSync(fileName)) {
+      //   fs.unlinkSync(fileName);
+      // }
     } catch (error) {
       logger.error('Error handling view-leaderboard command', {
         executor: { 

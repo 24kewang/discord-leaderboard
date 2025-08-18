@@ -4,3 +4,4 @@ logs/
 credentials/
 *.log
 *.png
+*.json

@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits, REST, Routes } from 'discord.js';
 import { google } from 'googleapis';
-import puppeteer from 'puppeteer';
+// import puppeteer from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -228,6 +228,7 @@ class GoogleSheetsService {
 // ============================================================================
 // TABLE IMAGE GENERATOR
 // ============================================================================
+/*
 class TableImageGenerator {
   static async generateLeaderboardImage(data, fileName = 'leaderboard.png') {
     const html = `
@@ -375,7 +376,7 @@ class TableImageGenerator {
     }
   }
 }
-
+*/
 // ============================================================================
 // COMMAND HANDLERS
 // ============================================================================

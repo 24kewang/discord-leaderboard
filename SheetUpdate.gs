@@ -298,6 +298,7 @@ function extractNetID(email) {
  */
 function processFormSubmissions(formResponses, events, eventLookup, eventPoints) {
   const members = new Map();
+  const submittedEvents = new Map(); // Map of netID to Set of event indices
   
   // Traverse in reverse order (most recent first)
   for (let i = formResponses.length - 1; i >= 0; i--) {
@@ -308,11 +309,20 @@ function processFormSubmissions(formResponses, events, eventLookup, eventPoints)
       continue;
     }
     
+    // Extract netID early for duplicate checking
+    const netID = extractNetID(response[RESPONSE_FIELDS.EMAIL]);
+    
     // Find matching event with valid timestamp
     const eventIndices = eventLookup.get(response[RESPONSE_FIELDS.EVENT_CODE]);
+    let validEventIndex = null;
     let validEvent = null;
     
     for (const idx of eventIndices) {
+      // Check if this user already submitted for this event
+      if (submittedEvents.has(netID) && submittedEvents.get(netID).has(idx)) {
+        continue; // Skip duplicate submission
+      }
+      
       const event = events[idx];
       if (isValidSubmission(
         response[RESPONSE_FIELDS.TIMESTAMP],
@@ -322,6 +332,7 @@ function processFormSubmissions(formResponses, events, eventLookup, eventPoints)
         CONFIG.TOLERANCE_MINUTES
       )) {
         validEvent = event;
+        validEventIndex = idx;
         break;
       }
     }
@@ -330,11 +341,14 @@ function processFormSubmissions(formResponses, events, eventLookup, eventPoints)
       continue; // No valid event found for this submission
     }
     
+    // Record this submission to prevent duplicates
+    if (!submittedEvents.has(netID)) {
+      submittedEvents.set(netID, new Set());
+    }
+    submittedEvents.get(netID).add(validEventIndex);
+    
     // Get point value for this event type
     const pointIncrement = eventPoints.get(validEvent[EVENT_FIELDS.EVENT_TYPE]) || CONFIG.DEFAULT_POINTS;
-    
-    // Extract netID and update member
-    const netID = extractNetID(response[RESPONSE_FIELDS.EMAIL]);
     
     if (!members.has(netID)) {
       // Create new member
@@ -342,7 +356,7 @@ function processFormSubmissions(formResponses, events, eventLookup, eventPoints)
         [MEMBER_FIELDS.FIRST_NAME]: response[RESPONSE_FIELDS.FIRST_NAME],
         [MEMBER_FIELDS.LAST_NAME]: response[RESPONSE_FIELDS.LAST_NAME],
         [MEMBER_FIELDS.ANONYMOUS]: response[RESPONSE_FIELDS.ANONYMOUS] && 
-                                    response[RESPONSE_FIELDS.ANONYMOUS].toString().toLowerCase().includes('yes'),
+                                    !response[RESPONSE_FIELDS.ANONYMOUS].toString().toLowerCase().includes('yes'),
         [MEMBER_FIELDS.POINTS]: pointIncrement,
         [MEMBER_FIELDS.LAST_UPDATE]: response[RESPONSE_FIELDS.TIMESTAMP]
       });

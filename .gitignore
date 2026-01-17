@@ -3,5 +3,5 @@ node_modules/
 logs/
 credentials/
 *.log
-*.png
+# *.png
 *.json

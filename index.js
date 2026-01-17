@@ -1029,7 +1029,7 @@ class DiscordBot {
   }
 
   setupEventHandlers() {
-    this.client.once('ready', () => {
+    this.client.once('clientReady', () => {
       logger.info(`Bot logged in as ${this.client.user.tag}`);
     });
 

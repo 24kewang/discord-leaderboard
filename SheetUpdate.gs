@@ -304,13 +304,25 @@ function processFormSubmissions(formResponses, events, eventLookup, eventPoints)
   for (let i = formResponses.length - 1; i >= 0; i--) {
     const response = formResponses[i];
     
+    // Extract netID early
+    const netID = extractNetID(response[RESPONSE_FIELDS.EMAIL]);
+    
+    // Add member info on first occurrence to capture latest information
+    if (!members.has(netID)) {
+      members.set(netID, {
+        [MEMBER_FIELDS.FIRST_NAME]: response[RESPONSE_FIELDS.FIRST_NAME],
+        [MEMBER_FIELDS.LAST_NAME]: response[RESPONSE_FIELDS.LAST_NAME],
+        [MEMBER_FIELDS.ANONYMOUS]: !response[RESPONSE_FIELDS.ANONYMOUS] || response[RESPONSE_FIELDS.ANONYMOUS] && 
+                                    !response[RESPONSE_FIELDS.ANONYMOUS].toString().toLowerCase().includes('yes'),
+        [MEMBER_FIELDS.POINTS]: 0,
+        [MEMBER_FIELDS.LAST_UPDATE]: response[RESPONSE_FIELDS.TIMESTAMP]
+      });
+    }
+    
     // Check if event code is valid
     if (!eventLookup.has(response[RESPONSE_FIELDS.EVENT_CODE])) {
       continue;
     }
-    
-    // Extract netID early for duplicate checking
-    const netID = extractNetID(response[RESPONSE_FIELDS.EMAIL]);
     
     // Find matching event with valid timestamp
     const eventIndices = eventLookup.get(response[RESPONSE_FIELDS.EVENT_CODE]);
@@ -350,21 +362,9 @@ function processFormSubmissions(formResponses, events, eventLookup, eventPoints)
     // Get point value for this event type
     const pointIncrement = eventPoints.get(validEvent[EVENT_FIELDS.EVENT_TYPE]) || CONFIG.DEFAULT_POINTS;
     
-    if (!members.has(netID)) {
-      // Create new member
-      members.set(netID, {
-        [MEMBER_FIELDS.FIRST_NAME]: response[RESPONSE_FIELDS.FIRST_NAME],
-        [MEMBER_FIELDS.LAST_NAME]: response[RESPONSE_FIELDS.LAST_NAME],
-        [MEMBER_FIELDS.ANONYMOUS]: response[RESPONSE_FIELDS.ANONYMOUS] && 
-                                    !response[RESPONSE_FIELDS.ANONYMOUS].toString().toLowerCase().includes('yes'),
-        [MEMBER_FIELDS.POINTS]: pointIncrement,
-        [MEMBER_FIELDS.LAST_UPDATE]: response[RESPONSE_FIELDS.TIMESTAMP]
-      });
-    } else {
-      // Update existing member (only increment points)
-      const member = members.get(netID);
-      member[MEMBER_FIELDS.POINTS] += pointIncrement;
-    }
+    // Update member points
+    const member = members.get(netID);
+    member[MEMBER_FIELDS.POINTS] += pointIncrement;
   }
   
   return members;

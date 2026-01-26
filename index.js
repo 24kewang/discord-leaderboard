@@ -20,8 +20,8 @@ const CONFIG = {
     TOKEN: process.env.DISCORD_TOKEN,
     CLIENT_ID: process.env.CLIENT_ID,
     GUILD_ID: process.env.GUILD_ID,
-    STAFF_ROLES: ['membership'],
-    ADMIN_ROLES: ['membership']
+    STAFF_ROLES: ['Technical', 'Membership', 'Professional'],
+    ADMIN_ROLES: ['Membership']
   },
   GOOGLE_SHEETS: {
     SPREADSHEET_ID: process.env.SPREADSHEET_ID,

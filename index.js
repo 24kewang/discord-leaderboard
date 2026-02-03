@@ -40,6 +40,7 @@ const CONFIG = {
 const EVENT_TYPES = {
   GENERAL_MEETING: 'General Meeting',
   TECHNICAL_WORKSHOP: 'Technical Workshop',
+  PROFESSIONAL_WORKSHOP: 'Professional Workshop',
   TECH_TALK: 'Tech Talk',
   SOCIAL: 'Social'
 };
@@ -1126,6 +1127,7 @@ class DiscordBot {
             choices: [
               { name: EVENT_TYPES.GENERAL_MEETING, value: EVENT_TYPES.GENERAL_MEETING },
               { name: EVENT_TYPES.TECHNICAL_WORKSHOP, value: EVENT_TYPES.TECHNICAL_WORKSHOP },
+              { name: EVENT_TYPES.PROFESSIONAL_WORKSHOP, value: EVENT_TYPES.PROFESSIONAL_WORKSHOP },
               { name: EVENT_TYPES.TECH_TALK, value: EVENT_TYPES.TECH_TALK },
               { name: EVENT_TYPES.SOCIAL, value: EVENT_TYPES.SOCIAL },
             ]

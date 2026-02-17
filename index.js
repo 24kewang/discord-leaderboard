@@ -424,14 +424,14 @@ class CommandHandlers {
       }
 
       let leaderboardText = '```\n🏆 LEADERBOARD - TOP 15 🏆\n\n';
-      leaderboardText += 'Rank | Name                    | Points\n';
-      leaderboardText += '-----|-------------------------|----------\n';
+      leaderboardText += 'Rank Name                    Points\n';
+      leaderboardText += '----|-------------------------|----\n';
       
       processedData.forEach((row, index) => {
         const rank = (index + 1).toString().padStart(2, ' ');
         const name = row.name.padEnd(23, ' ').substring(0, 23);
-        const points = Number(row.points).toLocaleString().padStart(8, ' ');
-        leaderboardText += `${rank}   | ${name} | ${points}\n`;
+        const points = Number(row.points).toLocaleString().padStart(2, ' ');
+        leaderboardText += `${rank}  | ${name} | ${points}\n`;
       });
       
       leaderboardText += '```';

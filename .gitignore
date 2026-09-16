@@ -4,4 +4,9 @@ logs/
 credentials/
 *.log
 # *.png
+# Covers data/server-state.json (per-guild bot state, see ServerStateStore in
+# index.js) — it must stay untracked so deploys never overwrite it. package.json
+# and package-lock.json remain tracked because they were committed before this
+# rule existed; git never untracks files retroactively. Any new JSON file that
+# does belong in the repo needs `git add -f`.
 *.json

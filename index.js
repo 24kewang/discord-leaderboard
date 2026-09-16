@@ -27,12 +27,18 @@ const CONFIG = {
     SPREADSHEET_ID: process.env.SPREADSHEET_ID,
     CREDENTIALS_PATH: process.env.CREDENTIALS_PATH,
     EVENTS_SHEET: process.env.EVENTS_SHEET || 'Event Codes',
-    POINTS_SHEET: process.env.POINTS_SHEET || 'Points Record',
+    // Points are now tracked per semester, in sheets named "{SemesterCode} {suffix}"
+    // (e.g. "SP26 Points Record"). POINTS_SHEET is kept as a fallback env var name
+    // for backward compatibility with existing .env files.
+    POINTS_SHEET_SUFFIX: process.env.POINTS_SHEET_SUFFIX || process.env.POINTS_SHEET || 'Points Record',
     TYPES_SHEET: process.env.TYPES_SHEET || 'Points System'
   },
   TIMEZONE: 'America/Chicago',
   ASSETS: {
     ATTENDANCE_QR_PATH: './assets/attendance-qr.png'
+  },
+  SERVER_STATE: {
+    FILE_PATH: path.resolve(__dirname, 'data', 'server-state.json')
   }
 };
 
@@ -98,6 +104,17 @@ const PERMISSION_LEVELS = {
   USER: 'USER',
   STAFF: 'STAFF',
   ADMIN: 'ADMIN'
+};
+
+// Leaderboard aggregation modes (set per guild via /set-leaderboard-mode)
+const LEADERBOARD_MODES = {
+  SEMESTER: 'semester',
+  YEAR: 'year'
+};
+
+// Defaults applied to any guild that has never set a value
+const DEFAULT_SERVER_STATE = {
+  leaderboardMode: LEADERBOARD_MODES.SEMESTER
 };
 
 // ============================================================================
@@ -198,6 +215,46 @@ function isTimeAfter(startTime, endTime) {
   return end.isAfter(start);
 }
 
+function getPointsSheetName(semesterCode) {
+  return `${semesterCode} ${CONFIG.GOOGLE_SHEETS.POINTS_SHEET_SUFFIX}`;
+}
+
+// Lenient, bot-side "what semester is it right now" rule. Jun/Jul roll into the
+// just-finished Spring, since Fall has not started yet. This is deliberately
+// different from SheetUpdate.gs's strict per-response classifier, which buckets
+// an individual form response by its own date (Jan-May = SP, Aug-Dec = FA).
+function getCurrentSemesterContext() {
+  const now = moment().tz(CONFIG.TIMEZONE);
+  const month = now.month(); // 0 = January ... 11 = December
+  const yy = now.format('YY');
+
+  // Jan-Jul: the current semester is this year's Spring, and the academic year
+  // in progress started with last year's Fall (e.g. Feb 2026 -> FA25 + SP26).
+  if (month <= 6) {
+    const previousYY = moment(now).subtract(1, 'year').format('YY');
+    return {
+      currentSemester: `SP${yy}`,
+      academicYear: { fall: `FA${previousYY}`, spring: `SP${yy}` }
+    };
+  }
+
+  // Aug-Dec: the current semester is this year's Fall, and the academic year
+  // in progress ends with next year's Spring (e.g. Sep 2026 -> FA26 + SP27).
+  const nextYY = moment(now).add(1, 'year').format('YY');
+  return {
+    currentSemester: `FA${yy}`,
+    academicYear: { fall: `FA${yy}`, spring: `SP${nextYY}` }
+  };
+}
+
+function isValidSemesterCode(code) {
+  return typeof code === 'string' && /^(SP|FA)\d{2}$/i.test(code.trim());
+}
+
+function normalizeSemesterCode(code) {
+  return code.trim().toUpperCase();
+}
+
 // ============================================================================
 // LOGGING SETUP
 // ============================================================================
@@ -268,6 +325,88 @@ class Logger {
 const logger = new Logger();
 
 // ============================================================================
+// SERVER STATE STORE
+// ============================================================================
+// Per-guild settings that must survive restarts and redeploys, stored as a
+// small JSON file on disk: { "<guildId>": { "leaderboardMode": "semester" } }.
+// The file is gitignored, so a CI/CD `git reset --hard` leaves it untouched.
+class ServerStateStore {
+  constructor(filePath = CONFIG.SERVER_STATE.FILE_PATH) {
+    this.filePath = filePath;
+    this.ensureDataDirectory();
+  }
+
+  ensureDataDirectory() {
+    const dataDir = path.dirname(this.filePath);
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+  }
+
+  // Any failure (missing file, empty file, corrupt JSON) falls back to empty
+  // state rather than throwing, so a damaged file can never break a command.
+  readAll() {
+    try {
+      if (!fs.existsSync(this.filePath)) return {};
+
+      const raw = fs.readFileSync(this.filePath, 'utf8');
+      if (!raw.trim()) return {};
+
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        logger.warn('Server state file has unexpected shape, using default state', {
+          filePath: this.filePath
+        });
+        return {};
+      }
+
+      return parsed;
+    } catch (error) {
+      logger.error('Failed to read server state file, using default state', {
+        filePath: this.filePath,
+        error: error.message
+      });
+      return {};
+    }
+  }
+
+  // Write to a temp file then rename, so an interrupted write cannot leave a
+  // half-written state file behind.
+  writeAll(state) {
+    const tempPath = `${this.filePath}.tmp`;
+    try {
+      this.ensureDataDirectory();
+      fs.writeFileSync(tempPath, JSON.stringify(state, null, 2), 'utf8');
+      fs.renameSync(tempPath, this.filePath);
+      return true;
+    } catch (error) {
+      logger.error('Failed to write server state file', {
+        filePath: this.filePath,
+        error: error.message
+      });
+      return false;
+    }
+  }
+
+  getGuildState(guildId) {
+    const allState = this.readAll();
+    return { ...DEFAULT_SERVER_STATE, ...(allState[guildId] || {}) };
+  }
+
+  getLeaderboardMode(guildId) {
+    return this.getGuildState(guildId).leaderboardMode;
+  }
+
+  setLeaderboardMode(guildId, mode) {
+    const allState = this.readAll();
+    allState[guildId] = { ...(allState[guildId] || {}), leaderboardMode: mode };
+    return this.writeAll(allState);
+  }
+}
+
+const serverStateStore = new ServerStateStore();
+
+// ============================================================================
 // GOOGLE SHEETS SERVICE
 // ============================================================================
 class GoogleSheetsService {
@@ -330,7 +469,7 @@ class GoogleSheetsService {
       
       logger.info('Sheet data updated successfully', { sheetName, sheetType });
     } catch (error) {
-      logger.error('Failed to write sheet data', { 
+      logger.error('Failed to write sheet data', {
         error: error.message,
         sheetName,
         sheetType
@@ -338,8 +477,138 @@ class GoogleSheetsService {
       throw error;
     }
   }
+
+  async listSheetTitles() {
+    try {
+      if (!this.sheets) await this.authenticate();
+
+      const response = await this.sheets.spreadsheets.get({
+        spreadsheetId: CONFIG.GOOGLE_SHEETS.SPREADSHEET_ID,
+        fields: 'sheets.properties.title',
+      });
+
+      return (response.data.sheets || []).map(sheet => sheet.properties.title);
+    } catch (error) {
+      logger.error('Failed to list sheet titles', { error: error.message });
+      throw error;
+    }
+  }
+
+  // Pass knownTitles when checking several sheets at once to avoid repeated
+  // metadata round trips.
+  async sheetExists(sheetName, knownTitles = null) {
+    const titles = knownTitles || await this.listSheetTitles();
+    return titles.includes(sheetName);
+  }
+
+  // Returns null when the sheet simply does not exist, so callers can tell an
+  // expected "no leaderboard yet" case apart from a real API failure (which
+  // still throws, as in fetchSheetData).
+  async fetchSheetDataIfExists(sheetName, sheetType, knownTitles = null) {
+    const exists = await this.sheetExists(sheetName, knownTitles);
+    if (!exists) return null;
+
+    return this.fetchSheetData(sheetName, sheetType);
+  }
 }
 
+
+// ============================================================================
+// LEADERBOARD HELPERS
+// ============================================================================
+// Shared by /view-leaderboard and /view-past-leaderboard so the ranking rules
+// and table rendering only live in one place.
+function buildLeaderboardEntries(rows) {
+  if (!rows || rows.length <= 1) return [];
+
+  const firstNameIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.FIRST_NAME);
+  const lastNameIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.LAST_NAME);
+  const pointsIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.POINTS);
+  const anonymousIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.ANONYMOUS);
+
+  return rows.slice(1)
+    .filter(row => {
+      const points = row[pointsIndex];
+      return points !== undefined && points !== null && `${points}`.trim() !== '' && !isNaN(points);
+    })
+    .map(row => {
+      const firstName = row[firstNameIndex] || '';
+      const lastName = row[lastNameIndex] || '';
+      const fullName = `${firstName} ${lastName}`.trim() || 'Unknown';
+
+      return {
+        name: isAnonymous(row[anonymousIndex]) ? 'Anonymous' : fullName,
+        points: parseInt(row[pointsIndex]) || 0,
+        originalName: fullName
+      };
+    })
+    .sort((a, b) => b.points - a.points)
+    .slice(0, 15); // Top 15
+}
+
+function formatLeaderboardTable(entries, headerText = '🏆 LEADERBOARD - TOP 15 🏆') {
+  let leaderboardText = `\`\`\`\n${headerText}\n\n`;
+  leaderboardText += 'Rank Name                    Points\n';
+  leaderboardText += '----|-------------------------|----\n';
+
+  entries.forEach((row, index) => {
+    const rank = (index + 1).toString().padStart(2, ' ');
+    const name = row.name.padEnd(23, ' ').substring(0, 23);
+    const points = Number(row.points).toLocaleString().padStart(2, ' ');
+    leaderboardText += `${rank}  | ${name} | ${points}\n`;
+  });
+
+  leaderboardText += '```';
+  return leaderboardText;
+}
+
+// Combines two per-semester points tables (header row + data rows, laid out per
+// COLUMN_ORDER.POINTS) into one: points are summed per NetID, while the name,
+// anonymity and timestamp fields come from whichever row was updated most
+// recently — the same "most recent wins" rule SheetUpdate.gs applies.
+function mergeSemesterPointsRows(rowsA, rowsB) {
+  const netIdIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.NETID);
+  const pointsIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.POINTS);
+  const lastUpdateIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.LAST_UPDATE);
+  const profileIndexes = [
+    SHEET_COLUMNS.POINTS.FIRST_NAME,
+    SHEET_COLUMNS.POINTS.LAST_NAME,
+    SHEET_COLUMNS.POINTS.ANONYMOUS,
+    SHEET_COLUMNS.POINTS.LAST_UPDATE
+  ].map(columnName => getColumnIndex('POINTS', columnName));
+
+  const mergedRows = new Map();
+
+  const ingestRows = (rows) => {
+    if (!rows || rows.length <= 1) return;
+
+    rows.slice(1).forEach(row => {
+      const netId = row[netIdIndex];
+      if (!netId) return;
+
+      const existingRow = mergedRows.get(netId);
+      if (!existingRow) {
+        mergedRows.set(netId, row.slice());
+        return;
+      }
+
+      const totalPoints = (parseInt(existingRow[pointsIndex]) || 0) + (parseInt(row[pointsIndex]) || 0);
+
+      const existingUpdate = moment(existingRow[lastUpdateIndex]);
+      const incomingUpdate = moment(row[lastUpdateIndex]);
+      if (incomingUpdate.isValid() && (!existingUpdate.isValid() || incomingUpdate.isAfter(existingUpdate))) {
+        profileIndexes.forEach(index => { existingRow[index] = row[index]; });
+      }
+
+      existingRow[pointsIndex] = totalPoints;
+    });
+  };
+
+  ingestRows(rowsA);
+  ingestRows(rowsB);
+
+  return [COLUMN_ORDER.POINTS, ...Array.from(mergedRows.values())];
+}
 
 // ============================================================================
 // COMMAND HANDLERS
@@ -370,89 +639,115 @@ class CommandHandlers {
         return;
       }
 
-      const rows = await this.sheetsService.fetchSheetData(CONFIG.GOOGLE_SHEETS.POINTS_SHEET, 'POINTS');
-      
+      const mode = serverStateStore.getLeaderboardMode(interaction.guildId);
+      const { currentSemester, academicYear } = getCurrentSemesterContext();
+
+      let rows = null;
+      let sourceLabel = currentSemester;
+
+      if (mode === LEADERBOARD_MODES.YEAR) {
+        // Aggregate the academic year: whichever of the two semester sheets
+        // exist. Only both being absent counts as "no leaderboard".
+        const fallSheetName = getPointsSheetName(academicYear.fall);
+        const springSheetName = getPointsSheetName(academicYear.spring);
+        const sheetTitles = await this.sheetsService.listSheetTitles();
+
+        const fallRows = await this.sheetsService.fetchSheetDataIfExists(fallSheetName, 'POINTS', sheetTitles);
+        const springRows = await this.sheetsService.fetchSheetDataIfExists(springSheetName, 'POINTS', sheetTitles);
+
+        if (!fallRows && !springRows) {
+          logger.info('[LEADERBOARD EMPTY] No sheets found for academic year', {
+            permissionLevel,
+            executor: {
+              discord_id: interaction.user.id,
+              username: interaction.user.username,
+              userDisplayName
+            },
+            command: { name: 'view-leaderboard' },
+            options: { mode, fall: academicYear.fall, spring: academicYear.spring },
+          });
+          await interaction.reply(`No leaderboard exists for ${academicYear.fall}/${academicYear.spring}.`);
+          return;
+        }
+
+        if (fallRows && springRows) {
+          rows = mergeSemesterPointsRows(fallRows, springRows);
+          sourceLabel = `${academicYear.fall}/${academicYear.spring}`;
+        } else {
+          // Only one half of the academic year has data so far — show it as is.
+          rows = fallRows || springRows;
+          sourceLabel = fallRows ? academicYear.fall : academicYear.spring;
+        }
+      } else {
+        const sheetName = getPointsSheetName(currentSemester);
+        rows = await this.sheetsService.fetchSheetDataIfExists(sheetName, 'POINTS');
+
+        if (!rows) {
+          logger.info('[LEADERBOARD EMPTY] No sheet found for current semester', {
+            permissionLevel,
+            executor: {
+              discord_id: interaction.user.id,
+              username: interaction.user.username,
+              userDisplayName
+            },
+            command: { name: 'view-leaderboard' },
+            options: { mode, semester: currentSemester },
+          });
+          await interaction.reply(`No leaderboard exists for ${currentSemester}.`);
+          return;
+        }
+      }
+
       if (rows.length <= 1) {
         logger.info('[LEADERBOARD EMPTY] No data found', {
           permissionLevel,
-          executor: { 
-            discord_id: interaction.user.id, 
-            username: interaction.user.username, 
-            userDisplayName 
+          executor: {
+            discord_id: interaction.user.id,
+            username: interaction.user.username,
+            userDisplayName
           },
           command: { name: 'view-leaderboard' },
+          options: { mode, source: sourceLabel },
         });
         await interaction.reply('No leaderboard data available.');
         return;
       }
 
-      const headers = rows[0];
-      const firstNameIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.FIRST_NAME);
-      const lastNameIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.LAST_NAME);
-      const pointsIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.POINTS);
-      const anonymousIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.ANONYMOUS);
-
-      // Process and sort data by points (descending)
-      const processedData = rows.slice(1)
-        .filter(row => row[pointsIndex] && !isNaN(row[pointsIndex])) // Only rows with valid points
-        .map(row => {
-          const firstName = row[firstNameIndex] || '';
-          const lastName = row[lastNameIndex] || '';
-          const fullName = `${firstName} ${lastName}`.trim() || 'Unknown';
-          
-          return {
-            name: isAnonymous(row[anonymousIndex]) ? 'Anonymous' : fullName,
-            points: parseInt(row[pointsIndex]) || 0,
-            originalName: fullName
-          };
-        })
-        .sort((a, b) => b.points - a.points)
-        .slice(0, 15); // Top 15
+      const processedData = buildLeaderboardEntries(rows);
 
       if (processedData.length === 0) {
         logger.info('[LEADERBOARD EMPTY / INVALID] No valid data found', {
           permissionLevel,
-          executor: { 
-            discord_id: interaction.user.id, 
-            username: interaction.user.username, 
-            userDisplayName 
+          executor: {
+            discord_id: interaction.user.id,
+            username: interaction.user.username,
+            userDisplayName
           },
           command: { name: 'view-leaderboard' },
+          options: { mode, source: sourceLabel },
         });
         await interaction.reply('No valid leaderboard data available.');
         return;
       }
 
-      let leaderboardText = '```\n🏆 LEADERBOARD - TOP 15 🏆\n\n';
-      leaderboardText += 'Rank Name                    Points\n';
-      leaderboardText += '----|-------------------------|----\n';
-      
-      processedData.forEach((row, index) => {
-        const rank = (index + 1).toString().padStart(2, ' ');
-        const name = row.name.padEnd(23, ' ').substring(0, 23);
-        const points = Number(row.points).toLocaleString().padStart(2, ' ');
-        leaderboardText += `${rank}  | ${name} | ${points}\n`;
-      });
-      
-      leaderboardText += '```';
-      
-      await interaction.reply(leaderboardText);
-      
+      await interaction.reply(formatLeaderboardTable(processedData, `🏆 LEADERBOARD (${sourceLabel}) - TOP 15 🏆`));
+
       logger.info('[LEADERBOARD SUCCESS] Leaderboard generated', {
         permissionLevel,
-        executor: { 
-          discord_id: interaction.user.id, 
-          username: interaction.user.username, 
-          userDisplayName 
+        executor: {
+          discord_id: interaction.user.id,
+          username: interaction.user.username,
+          userDisplayName
         },
         command: { name: 'view-leaderboard' },
+        options: { mode, source: sourceLabel },
         results: { count: processedData.length },
       });
     } catch (error) {
       logger.error('Error handling view-leaderboard command', {
         permissionLevel,
-        executor: { 
-          discord_id: interaction.user.id, 
+        executor: {
+          discord_id: interaction.user.id,
           username: interaction.user.username,
           userDisplayName: getExecutorUsername(interaction)
         },
@@ -460,6 +755,203 @@ class CommandHandlers {
         error: error.message,
       });
       await interaction.reply('An error occurred while generating the leaderboard.');
+    }
+  }
+
+  async handleViewPastLeaderboard(interaction) {
+    const permissionLevel = PERMISSION_LEVELS.USER;
+
+    try {
+      const userDisplayName = getExecutorUsername(interaction);
+      const semesterInput = interaction.options.getString('semester');
+
+      // Check permissions (user commands always pass)
+      if (!checkPermissions(interaction, permissionLevel)) {
+        logger.warn('[PAST LEADERBOARD FAILED] Unauthorized access attempt', {
+          permissionLevel,
+          executor: {
+            discord_id: interaction.user.id,
+            username: interaction.user.username,
+            userDisplayName
+          },
+          command: { name: 'view-past-leaderboard' },
+          options: { semester: semesterInput },
+        });
+        await interaction.reply({ content: 'You do not have permission to use this command.', flags: ['Ephemeral'] });
+        return;
+      }
+
+      // Validate the semester format (this option is free text, unlike a choice)
+      if (!isValidSemesterCode(semesterInput)) {
+        logger.warn('[PAST LEADERBOARD FAILED] Invalid semester format', {
+          permissionLevel,
+          executor: {
+            discord_id: interaction.user.id,
+            username: interaction.user.username,
+            userDisplayName
+          },
+          command: { name: 'view-past-leaderboard' },
+          options: { semester: semesterInput },
+        });
+        await interaction.reply({
+          content: `Invalid semester format: "${semesterInput}". Please use a format like SP26 or FA25.`,
+          flags: ['Ephemeral']
+        });
+        return;
+      }
+
+      const semesterCode = normalizeSemesterCode(semesterInput);
+      const sheetName = getPointsSheetName(semesterCode);
+      const rows = await this.sheetsService.fetchSheetDataIfExists(sheetName, 'POINTS');
+
+      if (!rows) {
+        logger.info('[PAST LEADERBOARD EMPTY] No sheet found for semester', {
+          permissionLevel,
+          executor: {
+            discord_id: interaction.user.id,
+            username: interaction.user.username,
+            userDisplayName
+          },
+          command: { name: 'view-past-leaderboard' },
+          options: { semester: semesterCode },
+        });
+        await interaction.reply({ content: `No leaderboard exists for ${semesterCode}.`, flags: ['Ephemeral'] });
+        return;
+      }
+
+      const processedData = buildLeaderboardEntries(rows);
+
+      if (processedData.length === 0) {
+        logger.info('[PAST LEADERBOARD EMPTY / INVALID] No valid data found', {
+          permissionLevel,
+          executor: {
+            discord_id: interaction.user.id,
+            username: interaction.user.username,
+            userDisplayName
+          },
+          command: { name: 'view-past-leaderboard' },
+          options: { semester: semesterCode },
+        });
+        await interaction.reply({ content: `No valid leaderboard data available for ${semesterCode}.`, flags: ['Ephemeral'] });
+        return;
+      }
+
+      await interaction.reply(formatLeaderboardTable(processedData, `🏆 LEADERBOARD (${semesterCode}) - TOP 15 🏆`));
+
+      logger.info('[PAST LEADERBOARD SUCCESS] Leaderboard generated', {
+        permissionLevel,
+        executor: {
+          discord_id: interaction.user.id,
+          username: interaction.user.username,
+          userDisplayName
+        },
+        command: { name: 'view-past-leaderboard' },
+        options: { semester: semesterCode },
+        results: { count: processedData.length },
+      });
+
+    } catch (error) {
+      logger.error('Error handling view-past-leaderboard command', {
+        permissionLevel,
+        executor: {
+          discord_id: interaction.user.id,
+          username: interaction.user.username,
+          userDisplayName: getExecutorUsername(interaction)
+        },
+        command: { name: 'view-past-leaderboard' },
+        error: error.message,
+      });
+      await interaction.reply({ content: 'An error occurred while retrieving that leaderboard.', flags: ['Ephemeral'] });
+    }
+  }
+
+  async handleSetLeaderboardMode(interaction) {
+    const permissionLevel = PERMISSION_LEVELS.ADMIN;
+
+    try {
+      const userDisplayName = getExecutorUsername(interaction);
+      const mode = interaction.options.getString('mode');
+
+      // Check permissions
+      if (!checkPermissions(interaction, permissionLevel)) {
+        logger.warn('[SET LEADERBOARD MODE FAILED] Unauthorized access attempt', {
+          permissionLevel,
+          executor: {
+            discord_id: interaction.user.id,
+            username: interaction.user.username,
+            userDisplayName
+          },
+          command: { name: 'set-leaderboard-mode' },
+          options: { mode },
+        });
+        await interaction.reply({ content: 'You do not have permission to use this command.', flags: ['Ephemeral'] });
+        return;
+      }
+
+      // Discord restricts this option to the choices below, but guard anyway
+      if (!Object.values(LEADERBOARD_MODES).includes(mode)) {
+        logger.warn('[SET LEADERBOARD MODE FAILED] Invalid mode', {
+          permissionLevel,
+          executor: {
+            discord_id: interaction.user.id,
+            username: interaction.user.username,
+            userDisplayName
+          },
+          command: { name: 'set-leaderboard-mode' },
+          options: { mode },
+        });
+        await interaction.reply({
+          content: `Invalid leaderboard mode: "${mode}". Please choose "${LEADERBOARD_MODES.SEMESTER}" or "${LEADERBOARD_MODES.YEAR}".`,
+          flags: ['Ephemeral']
+        });
+        return;
+      }
+
+      const previousMode = serverStateStore.getLeaderboardMode(interaction.guildId);
+      const saved = serverStateStore.setLeaderboardMode(interaction.guildId, mode);
+
+      if (!saved) {
+        await interaction.reply({
+          content: 'The leaderboard mode could not be saved. Please check the bot logs and try again.',
+          flags: ['Ephemeral']
+        });
+        return;
+      }
+
+      logger.info('[SET LEADERBOARD MODE SUCCESS] Mode updated', {
+        permissionLevel,
+        executor: {
+          discord_id: interaction.user.id,
+          username: interaction.user.username,
+          userDisplayName
+        },
+        command: { name: 'set-leaderboard-mode' },
+        options: { mode },
+        before: { leaderboardMode: previousMode },
+        after: { leaderboardMode: mode },
+      });
+
+      const description = mode === LEADERBOARD_MODES.YEAR
+        ? 'the current academic year (fall + spring combined)'
+        : 'the current semester only';
+
+      await interaction.reply({
+        content: `✅ Leaderboard mode set to **${mode}** — /view-leaderboard will now show ${description}.`,
+        flags: ['Ephemeral']
+      });
+
+    } catch (error) {
+      logger.error('Error handling set-leaderboard-mode command', {
+        permissionLevel,
+        executor: {
+          discord_id: interaction.user.id,
+          username: interaction.user.username,
+          userDisplayName: getExecutorUsername(interaction)
+        },
+        command: { name: 'set-leaderboard-mode' },
+        error: error.message,
+      });
+      await interaction.reply({ content: 'An error occurred while updating the leaderboard mode.', flags: ['Ephemeral'] });
     }
   }
 
@@ -1044,6 +1536,12 @@ class DiscordBot {
           case 'view-leaderboard':
             await this.commandHandlers.handleViewLeaderboard(interaction);
             break;
+          case 'view-past-leaderboard':
+            await this.commandHandlers.handleViewPastLeaderboard(interaction);
+            break;
+          case 'set-leaderboard-mode':
+            await this.commandHandlers.handleSetLeaderboardMode(interaction);
+            break;
           case 'membership-logs':
             await this.commandHandlers.handleMembershipLogs(interaction);
             break;
@@ -1086,6 +1584,34 @@ class DiscordBot {
       {
         name: 'view-leaderboard',
         description: 'View the current leaderboard showing top 15 members by points.',
+      },
+      {
+        name: 'view-past-leaderboard',
+        description: 'View the leaderboard for a past semester (e.g. SP26 or FA25).',
+        options: [
+          {
+            name: 'semester',
+            description: 'Semester to view, formatted like SP26 or FA25',
+            type: 3,
+            required: true
+          },
+        ],
+      },
+      {
+        name: 'set-leaderboard-mode',
+        description: 'Set the leaderboard scope to semester or year. This is restricted to admin roles.',
+        options: [
+          {
+            name: 'mode',
+            description: 'Current semester only, or the full current academic year',
+            type: 3,
+            required: true,
+            choices: [
+              { name: 'Semester', value: LEADERBOARD_MODES.SEMESTER },
+              { name: 'Year', value: LEADERBOARD_MODES.YEAR },
+            ]
+          },
+        ],
       },
       {
         name: 'show-point-system',

@@ -13,8 +13,15 @@ const SHEET_NAMES = {
   FORM_RESPONSES: 'Form Responses 1',
   EVENT_CODES: 'Event Codes',
   POINTS_SYSTEM: 'Points System',
+  // Points are tracked per semester, in sheets named "{SemesterCode} {suffix}"
+  // (e.g. "SP26 Points Record"). Mirrors POINTS_SHEET_SUFFIX in index.js.
+  POINTS_RECORD_SUFFIX: 'Points Record',
+  // Combined all-time record across every response. Kept for bookkeeping only;
+  // the Discord bot reads the per-semester sheets instead.
   POINTS_RECORD: 'Points Record'
 };
+
+const RECORD_HEADER = ['NetID', 'First Name', 'Last Name', 'Anonymous', 'Points', 'Last Update'];
 
 const FORM_COLUMNS = {
   TIMESTAMP: 0,
@@ -116,24 +123,49 @@ function createTimeTrigger() {
 // ============================================================================
 
 /**
- * Main function to update leaderboard points based on form submissions
+ * Main function to update leaderboard points based on form submissions.
+ * Responses are split by the semester their own timestamp falls in, and each
+ * semester gets its own "{SemesterCode} Points Record" sheet. A combined
+ * "Points Record" sheet covering every response is also written for bookkeeping.
  */
 function updatePoints() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  
+
   // Retrieve data from sheets
   const formResponses = getFormResponses(ss);
   const events = getEvents(ss);
   const eventLookup = createEventLookup(events);
   const eventPoints = getEventPoints(ss);
-  
-  // Process form submissions
-  const members = processFormSubmissions(formResponses, events, eventLookup, eventPoints);
-  
-  // Update Points Record sheet
-  updatePointsRecord(ss, members);
-  
-  Logger.log('Points updated successfully!');
+
+  // Split responses by semester, then process each semester independently
+  const semesterBuckets = bucketFormSubmissionsBySemester(formResponses);
+  const updatedSheets = [];
+
+  semesterBuckets.forEach((responses, semesterCode) => {
+    const members = processFormSubmissions(responses, events, eventLookup, eventPoints);
+    const sheetName = getPointsRecordSheetName(semesterCode);
+
+    updatePointsRecord(ss, sheetName, members);
+    updatedSheets.push(sheetName);
+  });
+
+  // Also keep the combined all-time record across every response. This is for
+  // bookkeeping only — the Discord bot reads the per-semester sheets.
+  const allMembers = processFormSubmissions(formResponses, events, eventLookup, eventPoints);
+  updatePointsRecord(ss, SHEET_NAMES.POINTS_RECORD, allMembers);
+
+  Logger.log(updatedSheets.length > 0
+    ? `Points updated successfully for: ${updatedSheets.join(', ')}, and ${SHEET_NAMES.POINTS_RECORD}`
+    : `Points updated: no responses fell within a tracked semester, so only ${SHEET_NAMES.POINTS_RECORD} was written.`);
+}
+
+/**
+ * Builds the sheet name that holds a semester's points record
+ * @param {string} semesterCode - Semester code such as SP26 or FA25
+ * @returns {string} Sheet name, e.g. "SP26 Points Record"
+ */
+function getPointsRecordSheetName(semesterCode) {
+  return `${semesterCode} ${SHEET_NAMES.POINTS_RECORD_SUFFIX}`;
 }
 
 // ============================================================================
@@ -289,6 +321,53 @@ function extractNetID(email) {
 }
 
 /**
+ * Classifies a single form response into a semester by its own timestamp.
+ * Spring runs Jan-May and Fall runs Aug-Dec; Jun/Jul fall outside both, so
+ * responses from those months belong to no semester and are skipped.
+ * @param {Date|string} timestamp - Form submission timestamp
+ * @returns {string|null} Semester code such as SP26, or null if out of range
+ */
+function getSemesterForResponseDate(timestamp) {
+  const date = new Date(timestamp);
+  if (isNaN(date.getTime())) return null;
+
+  const month = date.getMonth(); // 0 = January ... 11 = December
+  const yy = (date.getFullYear() % 100).toString().padStart(2, '0');
+
+  if (month >= 0 && month <= 4) return `SP${yy}`;   // Jan-May
+  if (month >= 7 && month <= 11) return `FA${yy}`;  // Aug-Dec
+
+  return null; // Jun/Jul
+}
+
+/**
+ * Groups form responses by the semester their timestamp falls in, preserving
+ * the original row order within each group
+ * @param {Array} formResponses - Array of form responses
+ * @returns {Map} Map of semester codes to arrays of responses
+ */
+function bucketFormSubmissionsBySemester(formResponses) {
+  const buckets = new Map();
+
+  formResponses.forEach(response => {
+    const semesterCode = getSemesterForResponseDate(response[RESPONSE_FIELDS.TIMESTAMP]);
+
+    if (!semesterCode) {
+      Logger.log(`Skipping response outside any semester (Jun/Jul or invalid date): ` +
+                 `${response[RESPONSE_FIELDS.EMAIL]} at ${response[RESPONSE_FIELDS.TIMESTAMP]}`);
+      return;
+    }
+
+    if (!buckets.has(semesterCode)) {
+      buckets.set(semesterCode, []);
+    }
+    buckets.get(semesterCode).push(response);
+  });
+
+  return buckets;
+}
+
+/**
  * Processes all form submissions and builds member map
  * @param {Array} formResponses - Array of form responses
  * @param {Array} events - Array of events
@@ -375,24 +454,35 @@ function processFormSubmissions(formResponses, events, eventLookup, eventPoints)
 // ============================================================================
 
 /**
- * Updates the Points Record sheet with member data
+ * Returns a semester's points record sheet, creating it if it does not exist
  * @param {SpreadsheetApp.Spreadsheet} ss - Spreadsheet object
+ * @param {string} sheetName - Sheet name, e.g. "SP26 Points Record"
+ * @returns {SpreadsheetApp.Sheet} The existing or newly created sheet
+ */
+function getOrCreateSemesterSheet(ss, sheetName) {
+  const existingSheet = ss.getSheetByName(sheetName);
+  if (existingSheet) return existingSheet;
+
+  Logger.log(`Creating new sheet: ${sheetName}`);
+  return ss.insertSheet(sheetName);
+}
+
+/**
+ * Overwrites a semester's points record sheet with member data. The sheet is
+ * cleared in full (header included) and rewritten, so stale rows from a
+ * previous run can never survive.
+ * @param {SpreadsheetApp.Spreadsheet} ss - Spreadsheet object
+ * @param {string} sheetName - Sheet to write, e.g. "SP26 Points Record"
  * @param {Map} members - Map of members
  */
-function updatePointsRecord(ss, members) {
-  const sheet = ss.getSheetByName(SHEET_NAMES.POINTS_RECORD);
-  if (!sheet) {
-    throw new Error(`${SHEET_NAMES.POINTS_RECORD} sheet not found`);
-  }
-  
-  // Clear existing data (keep headers)
-  const lastRow = sheet.getLastRow();
-  if (lastRow > 1) {
-    sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clear();
-  }
-  
-  // Prepare data for output
-  const outputData = [];
+function updatePointsRecord(ss, sheetName, members) {
+  const sheet = getOrCreateSemesterSheet(ss, sheetName);
+
+  // Clear values only, so any manual formatting on the sheet survives
+  sheet.clearContents();
+
+  // Prepare data for output, starting with the header row
+  const outputData = [RECORD_HEADER];
   members.forEach((member, netID) => {
     const row = [];
     row[RECORD_COLUMNS.NET_ID] = netID;
@@ -403,9 +493,7 @@ function updatePointsRecord(ss, members) {
     row[RECORD_COLUMNS.LAST_UPDATE] = member[MEMBER_FIELDS.LAST_UPDATE];
     outputData.push(row);
   });
-  
-  // Write data to sheet
-  if (outputData.length > 0) {
-    sheet.getRange(2, 1, outputData.length, 6).setValues(outputData);
-  }
+
+  // Write header and data in a single pass
+  sheet.getRange(1, 1, outputData.length, RECORD_HEADER.length).setValues(outputData);
 }

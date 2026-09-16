@@ -51,7 +51,7 @@ CREDENTIALS_PATH=./credentials/sheets-api-key.json
 
 # Optional: Custom sheet names (defaults provided)
 EVENTS_SHEET=Event Codes
-POINTS_SHEET=Points Record
+POINTS_SHEET_SUFFIX=Points Record
 TYPES_SHEET=Points System
 ```
 
@@ -60,8 +60,12 @@ TYPES_SHEET=Points System
 1. Create a Google Sheets spreadsheet with the following sheets:
    - **Event Codes**: Contains event information (Date, Start Time, End Time, Event Name, Event Type, Event Code)
    - **Points System**: Maps event types to point values (Event Type, Points)
-   - **Points Record**: Member attendance and points (NetID, First Name, Last Name, Anonymous, Points, Last Update)
    - **Form Responses**: Form submission data (used by the Google Apps Script)
+
+   Points sheets are created automatically by the Apps Script, all with the columns
+   NetID, First Name, Last Name, Anonymous, Points, Last Update: one per semester that has
+   responses (e.g. **SP26 Points Record**, **FA26 Points Record**), which the bot reads, plus a
+   combined **Points Record** sheet of all-time totals kept for bookkeeping.
 
 2. Set up Google Sheets API:
    - Create a service account in Google Cloud Console
@@ -93,8 +97,10 @@ npm start
 
 All commands use Discord's slash command interface. Available commands include:
 
-- `/view-leaderboard` - [MEMBER] Display the current leaderboard with member rankings
+- `/view-leaderboard` - [MEMBER] Display the leaderboard for the current semester or academic year, depending on the mode
+- `/view-past-leaderboard` - [MEMBER] Display the leaderboard for a past semester (e.g. `SP26`)
 - `/membership-logs` - [ADMIN] View membership and attendance logs (staff/admin only)
+- `/set-leaderboard-mode` - [ADMIN] Set whether `/view-leaderboard` covers the semester or the academic year
 - `/add-event` - [STAFF] Add a new event to the system (staff/admin only)
 - `/show-event-list` - [STAFF] Display all upcoming and past events
 - `/get-attendance-qr` - [STAFF] Generate and display a QR code for event check-in
@@ -105,9 +111,11 @@ All commands use Discord's slash command interface. Available commands include:
 The `SheetUpdate.gs` file handles automatic point updates:
 
 1. Processes form submissions from the "Form Responses" sheet
-2. Matches submissions to events based on event codes and timestamps
-3. Validates attendance within the configured time window (default: 30 minutes before/after event)
-4. Updates the Points Record sheet with member point totals
+2. Groups submissions by semester using each response's timestamp (Jan-May = SP, Aug-Dec = FA)
+3. Matches submissions to events based on event codes and timestamps
+4. Validates attendance within the configured time window (default: 30 minutes before/after event)
+5. Overwrites each semester's "[SEMESTER] Points Record" sheet with member point totals, creating it if needed
+6. Also overwrites the combined "Points Record" sheet with all-time totals across every response (bookkeeping only — the bot doesn't read it)
 
 To enable auto-updates:
 1. Open the Google Sheet
@@ -122,11 +130,18 @@ discord-leaderboard/
 ├── SheetUpdate.gs             # Google Apps Script for point updates
 ├── package.json               # Node.js dependencies
 ├── .env                       # Environment variables (not in repo)
+├── .github/workflows/         # CI/CD (auto-deploy on push to main)
+│   └── deploy.yml
 ├── credentials/               # Google API credentials
 │   └── sheets-api-key.json
+├── data/                      # Per-server bot state (not in repo)
+│   └── server-state.json
 ├── logs/                      # Daily bot activity logs
 └── assets/                    # Static assets (QR codes, images)
 ```
+
+See [GUIDE.md](GUIDE.md) for a deeper walkthrough of the permission model, the
+per-semester sheet logic, and hosting the bot on a free-tier GCP VM with CI/CD.
 
 ## Logging
 

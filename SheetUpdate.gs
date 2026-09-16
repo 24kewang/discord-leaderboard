@@ -368,6 +368,40 @@ function bucketFormSubmissionsBySemester(formResponses) {
 }
 
 /**
+ * Computes the anonymity flag for a response. The form question is an opt-in
+ * ("show my name?"), so containing "yes" means NOT anonymous; anything else
+ * (blank, "No", typos) defaults to anonymous.
+ * @param {Object} response - A single form response
+ * @returns {boolean} True if this response should be treated as anonymous
+ */
+function computeAnonymousFlag(response) {
+  const anonymousValue = response[RESPONSE_FIELDS.ANONYMOUS];
+  return !anonymousValue || !anonymousValue.toString().toLowerCase().includes('yes');
+}
+
+/**
+ * Overwrites a member's profile fields (name, anonymity, last update) if this
+ * response is strictly more recent than what's already stored, so the
+ * profile always reflects the person's latest submission regardless of what
+ * order the responses were processed in. Unparsable timestamps are ignored
+ * rather than allowed to clobber a good value.
+ * @param {Object} member - The member object to update in place
+ * @param {Object} response - A candidate form response
+ */
+function updateMemberProfileIfNewer(member, response) {
+  const responseTimestamp = new Date(response[RESPONSE_FIELDS.TIMESTAMP]);
+  if (isNaN(responseTimestamp.getTime())) return;
+
+  const currentTimestamp = new Date(member[MEMBER_FIELDS.LAST_UPDATE]);
+  if (!isNaN(currentTimestamp.getTime()) && responseTimestamp <= currentTimestamp) return;
+
+  member[MEMBER_FIELDS.FIRST_NAME] = response[RESPONSE_FIELDS.FIRST_NAME];
+  member[MEMBER_FIELDS.LAST_NAME] = response[RESPONSE_FIELDS.LAST_NAME];
+  member[MEMBER_FIELDS.ANONYMOUS] = computeAnonymousFlag(response);
+  member[MEMBER_FIELDS.LAST_UPDATE] = response[RESPONSE_FIELDS.TIMESTAMP];
+}
+
+/**
  * Processes all form submissions and builds member map
  * @param {Array} formResponses - Array of form responses
  * @param {Array} events - Array of events
@@ -378,42 +412,41 @@ function bucketFormSubmissionsBySemester(formResponses) {
 function processFormSubmissions(formResponses, events, eventLookup, eventPoints) {
   const members = new Map();
   const submittedEvents = new Map(); // Map of netID to Set of event indices
-  
-  // Traverse in reverse order (most recent first)
-  for (let i = formResponses.length - 1; i >= 0; i--) {
-    const response = formResponses[i];
-    
-    // Extract netID early
+
+  // Iteration order does not matter for correctness: profile fields (name,
+  // anonymity, last update) are decided by comparing each response's own
+  // timestamp, not by which one is visited first.
+  formResponses.forEach(response => {
     const netID = extractNetID(response[RESPONSE_FIELDS.EMAIL]);
-    
-    // Add member info on first occurrence to capture latest information
+
     if (!members.has(netID)) {
       members.set(netID, {
         [MEMBER_FIELDS.FIRST_NAME]: response[RESPONSE_FIELDS.FIRST_NAME],
         [MEMBER_FIELDS.LAST_NAME]: response[RESPONSE_FIELDS.LAST_NAME],
-        [MEMBER_FIELDS.ANONYMOUS]: !response[RESPONSE_FIELDS.ANONYMOUS] || response[RESPONSE_FIELDS.ANONYMOUS] && 
-                                    !response[RESPONSE_FIELDS.ANONYMOUS].toString().toLowerCase().includes('yes'),
+        [MEMBER_FIELDS.ANONYMOUS]: computeAnonymousFlag(response),
         [MEMBER_FIELDS.POINTS]: 0,
         [MEMBER_FIELDS.LAST_UPDATE]: response[RESPONSE_FIELDS.TIMESTAMP]
       });
+    } else {
+      updateMemberProfileIfNewer(members.get(netID), response);
     }
-    
+
     // Check if event code is valid
     if (!eventLookup.has(response[RESPONSE_FIELDS.EVENT_CODE])) {
-      continue;
+      return;
     }
-    
+
     // Find matching event with valid timestamp
     const eventIndices = eventLookup.get(response[RESPONSE_FIELDS.EVENT_CODE]);
     let validEventIndex = null;
     let validEvent = null;
-    
+
     for (const idx of eventIndices) {
       // Check if this user already submitted for this event
       if (submittedEvents.has(netID) && submittedEvents.get(netID).has(idx)) {
         continue; // Skip duplicate submission
       }
-      
+
       const event = events[idx];
       if (isValidSubmission(
         response[RESPONSE_FIELDS.TIMESTAMP],
@@ -427,25 +460,25 @@ function processFormSubmissions(formResponses, events, eventLookup, eventPoints)
         break;
       }
     }
-    
+
     if (!validEvent) {
-      continue; // No valid event found for this submission
+      return; // No valid event found for this submission
     }
-    
+
     // Record this submission to prevent duplicates
     if (!submittedEvents.has(netID)) {
       submittedEvents.set(netID, new Set());
     }
     submittedEvents.get(netID).add(validEventIndex);
-    
+
     // Get point value for this event type
     const pointIncrement = eventPoints.get(validEvent[EVENT_FIELDS.EVENT_TYPE]) || CONFIG.DEFAULT_POINTS;
-    
+
     // Update member points
     const member = members.get(netID);
     member[MEMBER_FIELDS.POINTS] += pointIncrement;
-  }
-  
+  });
+
   return members;
 }
 

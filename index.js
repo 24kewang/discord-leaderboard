@@ -535,14 +535,24 @@ function buildLeaderboardEntries(rows) {
       const firstName = row[firstNameIndex] || '';
       const lastName = row[lastNameIndex] || '';
       const fullName = `${firstName} ${lastName}`.trim() || 'Unknown';
+      const anonymous = isAnonymous(row[anonymousIndex]);
 
       return {
-        name: isAnonymous(row[anonymousIndex]) ? 'Anonymous' : fullName,
+        name: anonymous ? 'Anonymous' : fullName,
         points: parseInt(row[pointsIndex]) || 0,
-        originalName: fullName
+        originalName: fullName,
+        // Tie-break key: an anonymous entry sorts as if its name were
+        // literally "Anonymous", first and last alike.
+        sortFirstName: anonymous ? 'Anonymous' : firstName,
+        sortLastName: anonymous ? 'Anonymous' : lastName
       };
     })
-    .sort((a, b) => b.points - a.points)
+    .sort((a, b) => {
+      if (b.points !== a.points) return b.points - a.points;
+      const firstNameCompare = a.sortFirstName.localeCompare(b.sortFirstName);
+      if (firstNameCompare !== 0) return firstNameCompare;
+      return a.sortLastName.localeCompare(b.sortLastName);
+    })
     .slice(0, 15); // Top 15
 }
 

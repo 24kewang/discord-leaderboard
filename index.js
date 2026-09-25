@@ -255,6 +255,50 @@ function normalizeSemesterCode(code) {
   return code.trim().toUpperCase();
 }
 
+// Sortable timestamp (ms) for an event's date + start time. An unreadable date
+// yields 0 so the event sorts last; an unreadable start time counts as
+// midnight so the event still sorts correctly by date.
+function getEventSortValue(dateStr, startTimeStr) {
+  const parsedDate = parseDate(dateStr);
+  if (!parsedDate) return 0;
+
+  // parseTime covers the formats the bot writes (3:30 PM) plus common manual
+  // ones (3pm, 15:30); sheets can also render times with seconds (3:30:00 PM).
+  let parsedTime = parseTime(startTimeStr);
+  if (!parsedTime && typeof startTimeStr === 'string') {
+    const withSeconds = moment(startTimeStr.trim(), ['h:mm:ss A', 'H:mm:ss'], true);
+    if (withSeconds.isValid()) parsedTime = withSeconds.format('h:mm A');
+  }
+
+  return moment(`${parsedDate} ${parsedTime || '12:00 AM'}`, 'YYYY-MM-DD h:mm A').valueOf();
+}
+
+// Splits table rows into code-block messages that each fit Discord's
+// 2000-character limit. Rows are never split across messages, and every
+// message after the first repeats the column header so it reads on its own.
+function buildCodeBlockChunks(firstHeader, continuationHeader, lines, maxLength = 2000) {
+  const fenceOpen = '```\n';
+  const fenceClose = '```';
+  const chunks = [];
+  let header = firstHeader;
+  let body = '';
+
+  const flush = () => {
+    chunks.push(`${fenceOpen}${header}${body}${fenceClose}`);
+    header = continuationHeader;
+    body = '';
+  };
+
+  lines.forEach(line => {
+    const projectedLength = fenceOpen.length + header.length + body.length + line.length + fenceClose.length;
+    if (body && projectedLength > maxLength) flush();
+    body += line;
+  });
+
+  if (body) flush();
+  return chunks;
+}
+
 // ============================================================================
 // LOGGING SETUP
 // ============================================================================
@@ -1289,23 +1333,23 @@ class CommandHandlers {
         return;
       }
 
-      const headers = rows[0];
       const dateIndex = getColumnIndex('EVENTS', SHEET_COLUMNS.EVENTS.DATE);
-      
-      // Sort events by most recent date
+      const startTimeIndex = getColumnIndex('EVENTS', SHEET_COLUMNS.EVENTS.START_TIME);
+
+      // Sort events by most recent date, then start time. Ties fall back to
+      // sheet position, so a later-added row counts as more recent.
       const eventData = rows.slice(1)
-        .map(row => ({
+        .map((row, rowIndex) => ({
           date: row[dateIndex] || '',
-          startTime: row[getColumnIndex('EVENTS', SHEET_COLUMNS.EVENTS.START_TIME)] || '',
+          startTime: row[startTimeIndex] || '',
           endTime: row[getColumnIndex('EVENTS', SHEET_COLUMNS.EVENTS.END_TIME)] || '',
           eventName: row[getColumnIndex('EVENTS', SHEET_COLUMNS.EVENTS.EVENT_NAME)] || '',
           eventType: row[getColumnIndex('EVENTS', SHEET_COLUMNS.EVENTS.EVENT_TYPE)] || '',
           eventCode: row[getColumnIndex('EVENTS', SHEET_COLUMNS.EVENTS.EVENT_CODE)] || '',
-          sortDate: moment(row[dateIndex], 'YYYY-MM-DD', true).isValid() 
-            ? moment(row[dateIndex], 'YYYY-MM-DD').valueOf() 
-            : 0
+          sortValue: getEventSortValue(row[dateIndex], row[startTimeIndex]),
+          rowIndex
         }))
-        .sort((a, b) => b.sortDate - a.sortDate);
+        .sort((a, b) => (b.sortValue - a.sortValue) || (b.rowIndex - a.rowIndex));
 
       // Limit to specified number or show all
       const displayEvents = numberOfEvents ? eventData.slice(0, numberOfEvents) : eventData;
@@ -1315,51 +1359,62 @@ class CommandHandlers {
         return;
       }
 
-      // Build table
-      let eventListText = '```\n';
-      eventListText += numberOfEvents 
+      // Build table rows
+      const tableHeader = 'Date       | Time                     | Event Name           | Type                  | Code\n' +
+                          '-----------|--------------------------|----------------------|-----------------------|----------\n';
+      const title = numberOfEvents
         ? `📅 RECENT EVENTS (Top ${numberOfEvents})\n\n`
         : '📅 ALL EVENTS\n\n';
-      eventListText += 'Date       | Time                     | Event Name           | Type                  | Code\n';
-      eventListText += '-----------|--------------------------|----------------------|-----------------------|----------\n';
-      
-      displayEvents.forEach(event => {
+
+      const eventLines = displayEvents.map(event => {
         const date = event.date.padEnd(10, ' ').substring(0, 10);
         const time = `${event.startTime}-${event.endTime}`.padEnd(24, ' ').substring(0, 24);
         const name = event.eventName.padEnd(20, ' ').substring(0, 20);
         const type = event.eventType.padEnd(21, ' ').substring(0, 21);
         const code = event.eventCode.padEnd(8, ' ').substring(0, 8);
-        eventListText += `${date} | ${time} | ${name} | ${type} | ${code}\n`;
+        return `${date} | ${time} | ${name} | ${type} | ${code}\n`;
       });
-      
-      eventListText += '```';
-      
-      await interaction.reply({ content: eventListText, flags: ['Ephemeral'] });
-      
+
+      // A single Discord message holds at most 2000 characters, which is only
+      // ~18 rows, so longer lists are sent as several messages.
+      const messages = buildCodeBlockChunks(title + tableHeader, tableHeader, eventLines);
+
+      await interaction.reply({ content: messages[0], flags: ['Ephemeral'] });
+      for (const message of messages.slice(1)) {
+        await interaction.followUp({ content: message, flags: ['Ephemeral'] });
+      }
+
       logger.info('[SHOW EVENT LIST SUCCESS] Event list displayed', {
         permissionLevel,
-        executor: { 
-          discord_id: interaction.user.id, 
+        executor: {
+          discord_id: interaction.user.id,
           username: interaction.user.username,
-          userDisplayName 
+          userDisplayName
         },
         command: { name: 'show-event-list' },
         options: { numberOfEvents },
-        results: { count: displayEvents.length }
+        results: { count: displayEvents.length, messages: messages.length }
       });
-      
+
     } catch (error) {
       logger.error('Error handling show-event-list command', {
         permissionLevel,
-        executor: { 
-          discord_id: interaction.user.id, 
+        executor: {
+          discord_id: interaction.user.id,
           username: interaction.user.username,
           userDisplayName: getExecutorUsername(interaction)
         },
         command: { name: 'show-event-list' },
         error: error.message,
       });
-      await interaction.reply({ content: 'An error occurred while retrieving the event list.', flags: ['Ephemeral'] });
+
+      // If part of the list was already sent, a second reply() would throw
+      const errorReply = { content: 'An error occurred while retrieving the event list.', flags: ['Ephemeral'] };
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp(errorReply);
+      } else {
+        await interaction.reply(errorReply);
+      }
     }
   }
 
@@ -1682,9 +1737,10 @@ class DiscordBot {
         options: [
           { 
             name: 'number-of-events', 
-            description: 'Number of recent events to display (optional, shows all if not specified)', 
-            type: 4, 
-            required: false 
+            description: 'Number of recent events to display (optional, shows all if not specified)',
+            type: 4,
+            required: false,
+            min_value: 1
           },
         ],
       },

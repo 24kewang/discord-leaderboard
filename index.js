@@ -63,8 +63,12 @@ const SHEET_COLUMNS = {
   },
   TYPES: {
     EVENT_TYPE: 'Event Type',
-    POINTS: 'Points'
+    POINTS: 'Points',
+    REQUIRED: 'Number required for active member'
   },
+  // Points sheets are read by header name, not position (see parsePointsTable):
+  // SheetUpdate.gs inserts one "# <type> attended" column per event type
+  // between Anonymous and Points, so their width varies.
   POINTS: {
     NETID: 'NetID',
     FIRST_NAME: 'First Name',
@@ -74,6 +78,9 @@ const SHEET_COLUMNS = {
     LAST_UPDATE: 'Last Update'
   }
 };
+
+// Matches a points sheet attendance column header, e.g. "# Social attended"
+const ATTENDANCE_HEADER_PATTERN = /^#\s*(.+?)\s+attended$/i;
 
 // Define the order of columns in each spreadsheet (left to right)
 const COLUMN_ORDER = {
@@ -87,16 +94,10 @@ const COLUMN_ORDER = {
   ],
   TYPES: [
     SHEET_COLUMNS.TYPES.EVENT_TYPE,
-    SHEET_COLUMNS.TYPES.POINTS
-  ],
-  POINTS: [
-    SHEET_COLUMNS.POINTS.NETID,
-    SHEET_COLUMNS.POINTS.FIRST_NAME,
-    SHEET_COLUMNS.POINTS.LAST_NAME,
-    SHEET_COLUMNS.POINTS.ANONYMOUS,
-    SHEET_COLUMNS.POINTS.POINTS,
-    SHEET_COLUMNS.POINTS.LAST_UPDATE
+    SHEET_COLUMNS.TYPES.POINTS,
+    SHEET_COLUMNS.TYPES.REQUIRED
   ]
+  // No POINTS entry: points sheets have a variable width and are read whole
 };
 
 // Command permission levels
@@ -125,6 +126,12 @@ function getColumnIndex(sheetType, columnName) {
 }
 
 function getSheetRange(sheetName, sheetType) {
+  // Variable-width sheets are read whole: a bare, quoted sheet name is a valid
+  // A1 range covering every populated cell
+  if (!COLUMN_ORDER[sheetType]) {
+    return `'${sheetName.replace(/'/g, "''")}'`;
+  }
+
   const lastColumn = String.fromCharCode(65 + COLUMN_ORDER[sheetType].length - 1);
   return `${sheetName}!A:${lastColumn}`;
 }
@@ -486,7 +493,7 @@ class GoogleSheetsService {
       
       // Ensure we have headers, if not create them
       if (data.length === 0) {
-        data.push(COLUMN_ORDER[sheetType]);
+        data.push(COLUMN_ORDER[sheetType] || []);
       }
       
       return data;
@@ -562,28 +569,106 @@ class GoogleSheetsService {
 // ============================================================================
 // Shared by /view-leaderboard and /view-past-leaderboard so the ranking rules
 // and table rendering only live in one place.
-function buildLeaderboardEntries(rows) {
+
+// Event types are matched case-insensitively and ignoring surrounding spaces,
+// so "# social attended" in a sheet still lines up with "Social" in Points System.
+function normalizeEventType(eventType) {
+  return `${eventType ?? ''}`.trim().toLowerCase();
+}
+
+// Turns a points sheet (header row + data rows) into member objects. Columns
+// are located by header text rather than position because the sheet has one
+// "# <type> attended" column per event type. Returns [] for a sheet whose
+// NetID or Points header can't be found.
+function parsePointsTable(rows) {
   if (!rows || rows.length <= 1) return [];
 
-  const firstNameIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.FIRST_NAME);
-  const lastNameIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.LAST_NAME);
-  const pointsIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.POINTS);
-  const anonymousIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.ANONYMOUS);
+  const header = rows[0].map(cell => `${cell ?? ''}`.trim());
+  const indexOf = (columnName) => header.findIndex(cell => cell.toLowerCase() === columnName.toLowerCase());
 
-  return rows.slice(1)
-    .filter(row => {
-      const points = row[pointsIndex];
+  const netIdIndex = indexOf(SHEET_COLUMNS.POINTS.NETID);
+  const firstNameIndex = indexOf(SHEET_COLUMNS.POINTS.FIRST_NAME);
+  const lastNameIndex = indexOf(SHEET_COLUMNS.POINTS.LAST_NAME);
+  const anonymousIndex = indexOf(SHEET_COLUMNS.POINTS.ANONYMOUS);
+  const pointsIndex = indexOf(SHEET_COLUMNS.POINTS.POINTS);
+  const lastUpdateIndex = indexOf(SHEET_COLUMNS.POINTS.LAST_UPDATE);
+
+  if (netIdIndex === -1 || pointsIndex === -1) {
+    logger.warn('Points sheet is missing a required header, treating it as empty', {
+      results: { header, missing: [netIdIndex === -1 && 'NetID', pointsIndex === -1 && 'Points'].filter(Boolean) }
+    });
+    return [];
+  }
+
+  const countColumns = [];
+  header.forEach((cell, index) => {
+    const match = cell.match(ATTENDANCE_HEADER_PATTERN);
+    if (match) countColumns.push({ eventType: normalizeEventType(match[1]), index });
+  });
+
+  const cellAt = (row, index) => (index === -1 ? '' : (row[index] ?? ''));
+
+  return rows.slice(1).map(row => ({
+    netId: `${cellAt(row, netIdIndex)}`.trim(),
+    firstName: cellAt(row, firstNameIndex),
+    lastName: cellAt(row, lastNameIndex),
+    anonymousRaw: cellAt(row, anonymousIndex),
+    points: cellAt(row, pointsIndex),
+    lastUpdate: cellAt(row, lastUpdateIndex),
+    counts: Object.fromEntries(countColumns.map(({ eventType, index }) => [eventType, parseInt(row[index]) || 0]))
+  }));
+}
+
+// Reads the Points System sheet (positional, COLUMN_ORDER.TYPES) into a Map of
+// normalized event type -> number of events needed to be an active member.
+// Blank, non-numeric or negative values mean the type is not required (0).
+function parseActiveRequirements(typeRows) {
+  const requirements = new Map();
+  if (!typeRows || typeRows.length <= 1) return requirements;
+
+  const eventTypeIndex = getColumnIndex('TYPES', SHEET_COLUMNS.TYPES.EVENT_TYPE);
+  const requiredIndex = getColumnIndex('TYPES', SHEET_COLUMNS.TYPES.REQUIRED);
+
+  typeRows.slice(1).forEach(row => {
+    const eventType = normalizeEventType(row[eventTypeIndex]);
+    if (!eventType) return;
+
+    const required = parseInt(row[requiredIndex], 10);
+    requirements.set(eventType, isNaN(required) || required < 0 ? 0 : required);
+  });
+
+  return requirements;
+}
+
+// Active means meeting every requirement: for each event type that requires
+// at least one event, the member attended at least that many. A required type
+// with no column in the sheet counts as 0 attended. Mirrors isActiveMember()
+// in SheetUpdate.gs.
+function isActiveMember(member, requirements) {
+  for (const [eventType, required] of requirements) {
+    if (required > 0 && (member.counts[eventType] || 0) < required) return false;
+  }
+  return true;
+}
+
+function buildLeaderboardEntries(members, requirements) {
+  if (!members || members.length === 0) return [];
+
+  return members
+    .filter(member => isActiveMember(member, requirements))
+    .filter(member => {
+      const points = member.points;
       return points !== undefined && points !== null && `${points}`.trim() !== '' && !isNaN(points);
     })
-    .map(row => {
-      const firstName = row[firstNameIndex] || '';
-      const lastName = row[lastNameIndex] || '';
+    .map(member => {
+      const firstName = member.firstName || '';
+      const lastName = member.lastName || '';
       const fullName = `${firstName} ${lastName}`.trim() || 'Unknown';
-      const anonymous = isAnonymous(row[anonymousIndex]);
+      const anonymous = isAnonymous(member.anonymousRaw);
 
       return {
         name: anonymous ? 'Anonymous' : fullName,
-        points: parseInt(row[pointsIndex]) || 0,
+        points: parseInt(member.points) || 0,
         originalName: fullName,
         // Tie-break key: an anonymous entry sorts as if its name were
         // literally "Anonymous", first and last alike.
@@ -616,52 +701,46 @@ function formatLeaderboardTable(entries, headerText = '🏆 LEADERBOARD - TOP 15
   return leaderboardText;
 }
 
-// Combines two per-semester points tables (header row + data rows, laid out per
-// COLUMN_ORDER.POINTS) into one: points are summed per NetID, while the name,
-// anonymity and timestamp fields come from whichever row was updated most
-// recently — the same "most recent wins" rule SheetUpdate.gs applies.
-function mergeSemesterPointsRows(rowsA, rowsB) {
-  const netIdIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.NETID);
-  const pointsIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.POINTS);
-  const lastUpdateIndex = getColumnIndex('POINTS', SHEET_COLUMNS.POINTS.LAST_UPDATE);
-  const profileIndexes = [
-    SHEET_COLUMNS.POINTS.FIRST_NAME,
-    SHEET_COLUMNS.POINTS.LAST_NAME,
-    SHEET_COLUMNS.POINTS.ANONYMOUS,
-    SHEET_COLUMNS.POINTS.LAST_UPDATE
-  ].map(columnName => getColumnIndex('POINTS', columnName));
+// Combines two semesters' parsed members into one academic-year list: points
+// and every attendance count are summed per NetID (the event types may differ
+// between the two sheets), while the name, anonymity and timestamp come from
+// whichever row was updated most recently — the same "most recent wins" rule
+// SheetUpdate.gs applies.
+function mergeMembers(membersA, membersB) {
+  const merged = new Map();
 
-  const mergedRows = new Map();
+  const ingest = (members) => {
+    (members || []).forEach(member => {
+      if (!member.netId) return;
 
-  const ingestRows = (rows) => {
-    if (!rows || rows.length <= 1) return;
-
-    rows.slice(1).forEach(row => {
-      const netId = row[netIdIndex];
-      if (!netId) return;
-
-      const existingRow = mergedRows.get(netId);
-      if (!existingRow) {
-        mergedRows.set(netId, row.slice());
+      const existing = merged.get(member.netId);
+      if (!existing) {
+        merged.set(member.netId, { ...member, counts: { ...member.counts } });
         return;
       }
 
-      const totalPoints = (parseInt(existingRow[pointsIndex]) || 0) + (parseInt(row[pointsIndex]) || 0);
+      const totalPoints = (parseInt(existing.points) || 0) + (parseInt(member.points) || 0);
+      Object.entries(member.counts).forEach(([eventType, attended]) => {
+        existing.counts[eventType] = (existing.counts[eventType] || 0) + attended;
+      });
 
-      const existingUpdate = moment(existingRow[lastUpdateIndex]);
-      const incomingUpdate = moment(row[lastUpdateIndex]);
+      const existingUpdate = moment(existing.lastUpdate);
+      const incomingUpdate = moment(member.lastUpdate);
       if (incomingUpdate.isValid() && (!existingUpdate.isValid() || incomingUpdate.isAfter(existingUpdate))) {
-        profileIndexes.forEach(index => { existingRow[index] = row[index]; });
+        existing.firstName = member.firstName;
+        existing.lastName = member.lastName;
+        existing.anonymousRaw = member.anonymousRaw;
+        existing.lastUpdate = member.lastUpdate;
       }
 
-      existingRow[pointsIndex] = totalPoints;
+      existing.points = totalPoints;
     });
   };
 
-  ingestRows(rowsA);
-  ingestRows(rowsB);
+  ingest(membersA);
+  ingest(membersB);
 
-  return [COLUMN_ORDER.POINTS, ...Array.from(mergedRows.values())];
+  return Array.from(merged.values());
 }
 
 // ============================================================================
@@ -670,6 +749,13 @@ function mergeSemesterPointsRows(rowsA, rowsB) {
 class CommandHandlers {
   constructor(sheetsService) {
     this.sheetsService = sheetsService;
+  }
+
+  // Active-member requirements from the Points System sheet, used to filter
+  // the leaderboards down to active members
+  async fetchActiveRequirements() {
+    const typeRows = await this.sheetsService.fetchSheetData(CONFIG.GOOGLE_SHEETS.TYPES_SHEET, 'TYPES');
+    return parseActiveRequirements(typeRows);
   }
 
   async handleViewLeaderboard(interaction) {
@@ -696,7 +782,8 @@ class CommandHandlers {
       const mode = serverStateStore.getLeaderboardMode(interaction.guildId);
       const { currentSemester, academicYear } = getCurrentSemesterContext();
 
-      let rows = null;
+      let members = null;
+      let requirements = null;
       let sourceLabel = currentSemester;
 
       if (mode === LEADERBOARD_MODES.YEAR) {
@@ -706,8 +793,12 @@ class CommandHandlers {
         const springSheetName = getPointsSheetName(academicYear.spring);
         const sheetTitles = await this.sheetsService.listSheetTitles();
 
-        const fallRows = await this.sheetsService.fetchSheetDataIfExists(fallSheetName, 'POINTS', sheetTitles);
-        const springRows = await this.sheetsService.fetchSheetDataIfExists(springSheetName, 'POINTS', sheetTitles);
+        const [fallRows, springRows, yearRequirements] = await Promise.all([
+          this.sheetsService.fetchSheetDataIfExists(fallSheetName, 'POINTS', sheetTitles),
+          this.sheetsService.fetchSheetDataIfExists(springSheetName, 'POINTS', sheetTitles),
+          this.fetchActiveRequirements(),
+        ]);
+        requirements = yearRequirements;
 
         if (!fallRows && !springRows) {
           logger.info('[LEADERBOARD EMPTY] No sheets found for academic year', {
@@ -725,16 +816,22 @@ class CommandHandlers {
         }
 
         if (fallRows && springRows) {
-          rows = mergeSemesterPointsRows(fallRows, springRows);
+          // Points and attendance counts are both summed across the year, so
+          // the active check below applies to the combined counts
+          members = mergeMembers(parsePointsTable(fallRows), parsePointsTable(springRows));
           sourceLabel = `${academicYear.fall}/${academicYear.spring}`;
         } else {
           // Only one half of the academic year has data so far — show it as is.
-          rows = fallRows || springRows;
+          members = parsePointsTable(fallRows || springRows);
           sourceLabel = fallRows ? academicYear.fall : academicYear.spring;
         }
       } else {
         const sheetName = getPointsSheetName(currentSemester);
-        rows = await this.sheetsService.fetchSheetDataIfExists(sheetName, 'POINTS');
+        const [rows, semesterRequirements] = await Promise.all([
+          this.sheetsService.fetchSheetDataIfExists(sheetName, 'POINTS'),
+          this.fetchActiveRequirements(),
+        ]);
+        requirements = semesterRequirements;
 
         if (!rows) {
           logger.info('[LEADERBOARD EMPTY] No sheet found for current semester', {
@@ -750,9 +847,11 @@ class CommandHandlers {
           await interaction.reply(`No leaderboard exists for ${currentSemester}.`);
           return;
         }
+
+        members = parsePointsTable(rows);
       }
 
-      if (rows.length <= 1) {
+      if (members.length === 0) {
         logger.info('[LEADERBOARD EMPTY] No data found', {
           permissionLevel,
           executor: {
@@ -767,10 +866,10 @@ class CommandHandlers {
         return;
       }
 
-      const processedData = buildLeaderboardEntries(rows);
+      const processedData = buildLeaderboardEntries(members, requirements);
 
       if (processedData.length === 0) {
-        logger.info('[LEADERBOARD EMPTY / INVALID] No valid data found', {
+        logger.info('[LEADERBOARD EMPTY] No active members found', {
           permissionLevel,
           executor: {
             discord_id: interaction.user.id,
@@ -779,12 +878,13 @@ class CommandHandlers {
           },
           command: { name: 'view-leaderboard' },
           options: { mode, source: sourceLabel },
+          results: { members: members.length },
         });
-        await interaction.reply('No valid leaderboard data available.');
+        await interaction.reply(`No members have met the active member requirements for ${sourceLabel} yet.`);
         return;
       }
 
-      await interaction.reply(formatLeaderboardTable(processedData, `🏆 LEADERBOARD (${sourceLabel}) - TOP 15 🏆`));
+      await interaction.reply(formatLeaderboardTable(processedData, `🏆 ACTIVE MEMBERS (${sourceLabel}) - TOP 15 🏆`));
 
       logger.info('[LEADERBOARD SUCCESS] Leaderboard generated', {
         permissionLevel,
@@ -795,7 +895,7 @@ class CommandHandlers {
         },
         command: { name: 'view-leaderboard' },
         options: { mode, source: sourceLabel },
-        results: { count: processedData.length },
+        results: { count: processedData.length, members: members.length },
       });
     } catch (error) {
       logger.error('Error handling view-leaderboard command', {
@@ -856,7 +956,12 @@ class CommandHandlers {
 
       const semesterCode = normalizeSemesterCode(semesterInput);
       const sheetName = getPointsSheetName(semesterCode);
-      const rows = await this.sheetsService.fetchSheetDataIfExists(sheetName, 'POINTS');
+      // Past semesters are judged against today's requirements, since the
+      // Points System sheet only holds the current ones
+      const [rows, requirements] = await Promise.all([
+        this.sheetsService.fetchSheetDataIfExists(sheetName, 'POINTS'),
+        this.fetchActiveRequirements(),
+      ]);
 
       if (!rows) {
         logger.info('[PAST LEADERBOARD EMPTY] No sheet found for semester', {
@@ -873,9 +978,9 @@ class CommandHandlers {
         return;
       }
 
-      const processedData = buildLeaderboardEntries(rows);
+      const members = parsePointsTable(rows);
 
-      if (processedData.length === 0) {
+      if (members.length === 0) {
         logger.info('[PAST LEADERBOARD EMPTY / INVALID] No valid data found', {
           permissionLevel,
           executor: {
@@ -890,7 +995,25 @@ class CommandHandlers {
         return;
       }
 
-      await interaction.reply(formatLeaderboardTable(processedData, `🏆 LEADERBOARD (${semesterCode}) - TOP 15 🏆`));
+      const processedData = buildLeaderboardEntries(members, requirements);
+
+      if (processedData.length === 0) {
+        logger.info('[PAST LEADERBOARD EMPTY] No active members found', {
+          permissionLevel,
+          executor: {
+            discord_id: interaction.user.id,
+            username: interaction.user.username,
+            userDisplayName
+          },
+          command: { name: 'view-past-leaderboard' },
+          options: { semester: semesterCode },
+          results: { members: members.length },
+        });
+        await interaction.reply({ content: `No members have met the active member requirements for ${semesterCode}.`, flags: ['Ephemeral'] });
+        return;
+      }
+
+      await interaction.reply(formatLeaderboardTable(processedData, `🏆 ACTIVE MEMBERS (${semesterCode}) - TOP 15 🏆`));
 
       logger.info('[PAST LEADERBOARD SUCCESS] Leaderboard generated', {
         permissionLevel,
@@ -901,7 +1024,7 @@ class CommandHandlers {
         },
         command: { name: 'view-past-leaderboard' },
         options: { semester: semesterCode },
-        results: { count: processedData.length },
+        results: { count: processedData.length, members: members.length },
       });
 
     } catch (error) {
@@ -1529,21 +1652,27 @@ class CommandHandlers {
 
       const eventTypeIndex = getColumnIndex('TYPES', SHEET_COLUMNS.TYPES.EVENT_TYPE);
       const pointsIndex = getColumnIndex('TYPES', SHEET_COLUMNS.TYPES.POINTS);
-      
+      const requiredIndex = getColumnIndex('TYPES', SHEET_COLUMNS.TYPES.REQUIRED);
+
       // Build the point system table
-      let pointSystemText = '```\n🎯 POINT SYSTEM\n\n';
-      pointSystemText += 'Event Type                | Points\n';
-      pointSystemText += '--------------------------|--------\n';
-      
-      rows.slice(1).forEach(row => {
+      const title = '🎯 POINT SYSTEM\n\n';
+      const tableHeader = 'Event Type                | Points | Req. for Active\n' +
+                          '--------------------------|--------|----------------\n';
+
+      const typeLines = rows.slice(1).map(row => {
         const eventType = (row[eventTypeIndex] || 'Unknown').padEnd(25, ' ').substring(0, 25);
         const points = (row[pointsIndex] || '0').toString().padStart(6, ' ');
-        pointSystemText += `${eventType} | ${points}\n`;
+        // A blank, invalid or zero requirement means the type isn't required
+        const requiredCount = parseInt(row[requiredIndex], 10);
+        const required = (requiredCount > 0 ? `${requiredCount}` : '-').padStart(15, ' ');
+        return `${eventType} | ${points} | ${required}\n`;
       });
-      
-      pointSystemText += '```';
-      
-      await interaction.reply(pointSystemText);
+
+      const messages = buildCodeBlockChunks(title + tableHeader, tableHeader, typeLines);
+      await interaction.reply(messages[0]);
+      for (const message of messages.slice(1)) {
+        await interaction.followUp(message);
+      }
       
       logger.info('[SHOW POINT SYSTEM SUCCESS] Point system displayed', {
         permissionLevel,

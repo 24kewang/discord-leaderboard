@@ -59,13 +59,15 @@ TYPES_SHEET=Points System
 
 1. Create a Google Sheets spreadsheet with the following sheets:
    - **Event Codes**: Contains event information (Date, Start Time, End Time, Event Name, Event Type, Event Code)
-   - **Points System**: Maps event types to point values (Event Type, Points)
+   - **Points System**: Maps event types to point values and active-member requirements (Event Type, Points, Number required for active member)
    - **Form Responses**: Form submission data (used by the Google Apps Script)
 
    Points sheets are created automatically by the Apps Script, all with the columns
-   NetID, First Name, Last Name, Anonymous, Points, Last Update: one per semester that has
-   responses (e.g. **SP26 Points Record**, **FA26 Points Record**), which the bot reads, plus a
-   combined **Points Record** sheet of all-time totals kept for bookkeeping.
+   NetID, First Name, Last Name, Anonymous, one `# [EVENT TYPE] attended` column per event type,
+   Points, Last Update:
+   - one per semester that has responses (e.g. **SP26 Points Record**), which the bot reads
+   - a combined **Points Record** sheet of all-time totals, kept for bookkeeping
+   - **Current Active Member List**: the current semester's members who meet every requirement
 
 2. Set up Google Sheets API:
    - Create a service account in Google Cloud Console
@@ -97,14 +99,14 @@ npm start
 
 All commands use Discord's slash command interface. Available commands include:
 
-- `/view-leaderboard` - [MEMBER] Display the leaderboard for the current semester or academic year, depending on the mode
-- `/view-past-leaderboard` - [MEMBER] Display the leaderboard for a past semester (e.g. `SP26`)
+- `/view-leaderboard` - [MEMBER] Display the active-member leaderboard for the current semester or academic year, depending on the mode
+- `/view-past-leaderboard` - [MEMBER] Display the active-member leaderboard for a past semester (e.g. `SP26`)
 - `/membership-logs` - [ADMIN] View membership and attendance logs (staff/admin only)
 - `/set-leaderboard-mode` - [ADMIN] Set whether `/view-leaderboard` covers the semester or the academic year
 - `/add-event` - [STAFF] Add a new event to the system (staff/admin only)
 - `/show-event-list` - [STAFF] Display all upcoming and past events
 - `/get-attendance-qr` - [STAFF] Generate and display a QR code for event check-in
-- `/show-point-system` - [MEMBER] Display the point values for each event type
+- `/show-point-system` - [MEMBER] Display the point values and active-member requirements for each event type
 
 ### Google Apps Script (SheetUpdate.gs)
 
@@ -116,6 +118,7 @@ The `SheetUpdate.gs` file handles automatic point updates:
 4. Validates attendance within the configured time window (default: 30 minutes before/after event)
 5. Overwrites each semester's "[SEMESTER] Points Record" sheet with member point totals, creating it if needed
 6. Also overwrites the combined "Points Record" sheet with all-time totals across every response (bookkeeping only — the bot doesn't read it)
+7. Overwrites "Current Active Member List" with the current semester's members who meet every active-member requirement
 
 To enable auto-updates:
 1. Open the Google Sheet

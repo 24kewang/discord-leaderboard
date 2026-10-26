@@ -18,10 +18,10 @@ const SHEET_NAMES = {
   POINTS_RECORD_SUFFIX: 'Points Record',
   // Combined all-time record across every response. Kept for bookkeeping only;
   // the Discord bot reads the per-semester sheets instead.
-  POINTS_RECORD: 'Points Record'
+  POINTS_RECORD: 'Points Record',
+  // Members of the current semester who meet every active-member requirement
+  ACTIVE_MEMBERS: 'Current Active Member List'
 };
-
-const RECORD_HEADER = ['NetID', 'First Name', 'Last Name', 'Anonymous', 'Points', 'Last Update'];
 
 const FORM_COLUMNS = {
   TIMESTAMP: 0,
@@ -43,16 +43,8 @@ const EVENT_COLUMNS = {
 
 const POINTS_COLUMNS = {
   EVENT_TYPE: 0,
-  POINTS: 1
-};
-
-const RECORD_COLUMNS = {
-  NET_ID: 0,
-  FIRST_NAME: 1,
-  LAST_NAME: 2,
-  ANONYMOUS: 3,
-  POINTS: 4,
-  LAST_UPDATE: 5
+  POINTS: 1,
+  REQUIRED: 2
 };
 
 const MEMBER_FIELDS = {
@@ -60,7 +52,8 @@ const MEMBER_FIELDS = {
   LAST_NAME: 'lastName',
   ANONYMOUS: 'anonymous',
   POINTS: 'points',
-  LAST_UPDATE: 'lastUpdate'
+  LAST_UPDATE: 'lastUpdate',
+  ATTENDANCE: 'attendance' // { [eventType]: number of events attended }
 };
 
 const EVENT_FIELDS = {
@@ -126,7 +119,8 @@ function createTimeTrigger() {
  * Main function to update leaderboard points based on form submissions.
  * Responses are split by the semester their own timestamp falls in, and each
  * semester gets its own "{SemesterCode} Points Record" sheet. A combined
- * "Points Record" sheet covering every response is also written for bookkeeping.
+ * "Points Record" sheet covering every response is also written for bookkeeping,
+ * and the current semester's active members go to "Current Active Member List".
  */
 function updatePoints() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -135,28 +129,42 @@ function updatePoints() {
   const formResponses = getFormResponses(ss);
   const events = getEvents(ss);
   const eventLookup = createEventLookup(events);
-  const eventPoints = getEventPoints(ss);
+  const typeConfig = getEventTypeConfig(ss);
 
   // Split responses by semester, then process each semester independently
   const semesterBuckets = bucketFormSubmissionsBySemester(formResponses);
+  const membersBySemester = new Map();
   const updatedSheets = [];
 
   semesterBuckets.forEach((responses, semesterCode) => {
-    const members = processFormSubmissions(responses, events, eventLookup, eventPoints);
+    const members = processFormSubmissions(responses, events, eventLookup, typeConfig.points);
     const sheetName = getPointsRecordSheetName(semesterCode);
 
-    updatePointsRecord(ss, sheetName, members);
+    updatePointsRecord(ss, sheetName, members, typeConfig.typeNames);
+    membersBySemester.set(semesterCode, members);
     updatedSheets.push(sheetName);
   });
 
   // Also keep the combined all-time record across every response. This is for
   // bookkeeping only — the Discord bot reads the per-semester sheets.
-  const allMembers = processFormSubmissions(formResponses, events, eventLookup, eventPoints);
-  updatePointsRecord(ss, SHEET_NAMES.POINTS_RECORD, allMembers);
+  const allMembers = processFormSubmissions(formResponses, events, eventLookup, typeConfig.points);
+  updatePointsRecord(ss, SHEET_NAMES.POINTS_RECORD, allMembers, typeConfig.typeNames);
+  updatedSheets.push(SHEET_NAMES.POINTS_RECORD);
 
-  Logger.log(updatedSheets.length > 0
-    ? `Points updated successfully for: ${updatedSheets.join(', ')}, and ${SHEET_NAMES.POINTS_RECORD}`
-    : `Points updated: no responses fell within a tracked semester, so only ${SHEET_NAMES.POINTS_RECORD} was written.`);
+  // Current semester's active members. Always rewritten — header-only when the
+  // semester has no responses yet — so last semester's list never lingers.
+  const currentSemester = getCurrentSemesterCode();
+  const currentMembers = membersBySemester.get(currentSemester) || new Map();
+  const activeMembers = new Map();
+  currentMembers.forEach((member, netID) => {
+    if (isActiveMember(member, typeConfig.typeNames, typeConfig.required)) {
+      activeMembers.set(netID, member);
+    }
+  });
+  updatePointsRecord(ss, SHEET_NAMES.ACTIVE_MEMBERS, activeMembers, typeConfig.typeNames);
+  updatedSheets.push(`${SHEET_NAMES.ACTIVE_MEMBERS} (${currentSemester}: ${activeMembers.size} active)`);
+
+  Logger.log(`Points updated successfully for: ${updatedSheets.join(', ')}`);
 }
 
 /**
@@ -250,23 +258,44 @@ function createEventLookup(events) {
 }
 
 /**
- * Retrieves event points from "Points System" sheet
- * @returns {Map} Map of event types to point values
+ * Retrieves the event type configuration from the "Points System" sheet
+ * @returns {Object} typeNames: event types in sheet order (this is also the
+ *   order of the "# <type> attended" columns); points: Map of event type to
+ *   point value; required: Map of event type to the number of events of that
+ *   type needed to be an active member (0 = not required)
  */
-function getEventPoints(ss) {
+function getEventTypeConfig(ss) {
   const sheet = ss.getSheetByName(SHEET_NAMES.POINTS_SYSTEM);
   if (!sheet) {
     throw new Error(`${SHEET_NAMES.POINTS_SYSTEM} sheet not found`);
   }
-  
+
   const data = sheet.getDataRange().getValues();
-  const pointsMap = new Map();
-  
+  const typeNames = [];
+  const points = new Map();
+  const required = new Map();
+
   for (let i = 1; i < data.length; i++) {
-    pointsMap.set(data[i][POINTS_COLUMNS.EVENT_TYPE], data[i][POINTS_COLUMNS.POINTS]);
+    const eventType = (data[i][POINTS_COLUMNS.EVENT_TYPE] || '').toString().trim();
+    if (!eventType) continue; // Skip blank rows
+
+    typeNames.push(eventType);
+    points.set(eventType, data[i][POINTS_COLUMNS.POINTS]);
+    required.set(eventType, parseRequirement(data[i][POINTS_COLUMNS.REQUIRED]));
   }
-  
-  return pointsMap;
+
+  return { typeNames, points, required };
+}
+
+/**
+ * Reads a "Number required for active member" cell. Blank, non-numeric or
+ * non-positive values all mean the event type is not required.
+ * @param {*} value - Raw cell value
+ * @returns {number} Required count, 0 if not required
+ */
+function parseRequirement(value) {
+  const required = parseInt(value, 10);
+  return isNaN(required) || required < 0 ? 0 : required;
 }
 
 // ============================================================================
@@ -338,6 +367,32 @@ function getSemesterForResponseDate(timestamp) {
   if (month >= 7 && month <= 11) return `FA${yy}`;  // Aug-Dec
 
   return null; // Jun/Jul
+}
+
+/**
+ * The semester it is right now, for the active member list. Unlike
+ * getSemesterForResponseDate this always answers: Jun/Jul roll into the
+ * Spring that just ended. Mirrors getCurrentSemesterContext() in index.js.
+ * @param {Date} [now] - Defaults to the current time
+ * @returns {string} Semester code such as SP26 or FA25
+ */
+function getCurrentSemesterCode(now) {
+  const date = now || new Date();
+  const yy = (date.getFullYear() % 100).toString().padStart(2, '0');
+  return date.getMonth() <= 6 ? `SP${yy}` : `FA${yy}`; // Jan-Jul -> SP, Aug-Dec -> FA
+}
+
+/**
+ * Whether a member meets every active-member requirement: for each event
+ * type with a requirement above 0, they attended at least that many.
+ * @param {Object} member - Member object from processFormSubmissions
+ * @param {Array} typeNames - Event types from the Points System sheet
+ * @param {Map} required - Map of event type to required count
+ * @returns {boolean} True if the member is active
+ */
+function isActiveMember(member, typeNames, required) {
+  const attendance = member[MEMBER_FIELDS.ATTENDANCE] || {};
+  return typeNames.every(eventType => (attendance[eventType] || 0) >= (required.get(eventType) || 0));
 }
 
 /**
@@ -425,7 +480,8 @@ function processFormSubmissions(formResponses, events, eventLookup, eventPoints)
         [MEMBER_FIELDS.LAST_NAME]: response[RESPONSE_FIELDS.LAST_NAME],
         [MEMBER_FIELDS.ANONYMOUS]: computeAnonymousFlag(response),
         [MEMBER_FIELDS.POINTS]: 0,
-        [MEMBER_FIELDS.LAST_UPDATE]: response[RESPONSE_FIELDS.TIMESTAMP]
+        [MEMBER_FIELDS.LAST_UPDATE]: response[RESPONSE_FIELDS.TIMESTAMP],
+        [MEMBER_FIELDS.ATTENDANCE]: {}
       });
     } else {
       updateMemberProfileIfNewer(members.get(netID), response);
@@ -472,11 +528,13 @@ function processFormSubmissions(formResponses, events, eventLookup, eventPoints)
     submittedEvents.get(netID).add(validEventIndex);
 
     // Get point value for this event type
-    const pointIncrement = eventPoints.get(validEvent[EVENT_FIELDS.EVENT_TYPE]) || CONFIG.DEFAULT_POINTS;
+    const eventType = (validEvent[EVENT_FIELDS.EVENT_TYPE] || '').toString().trim();
+    const pointIncrement = eventPoints.get(eventType) || CONFIG.DEFAULT_POINTS;
 
-    // Update member points
+    // Update member points and attendance count for this event type
     const member = members.get(netID);
     member[MEMBER_FIELDS.POINTS] += pointIncrement;
+    member[MEMBER_FIELDS.ATTENDANCE][eventType] = (member[MEMBER_FIELDS.ATTENDANCE][eventType] || 0) + 1;
   });
 
   return members;
@@ -501,32 +559,52 @@ function getOrCreateSemesterSheet(ss, sheetName) {
 }
 
 /**
- * Overwrites a semester's points record sheet with member data. The sheet is
- * cleared in full (header included) and rewritten, so stale rows from a
- * previous run can never survive.
+ * Header row shared by every points record sheet. There is one attendance
+ * column per event type, in Points System order, between Anonymous and Points.
+ * The Discord bot finds columns by these header names, so keep them in sync
+ * with parsePointsTable() in index.js.
+ * @param {Array} typeNames - Event types from the Points System sheet
+ * @returns {Array} Header row
+ */
+function buildRecordHeader(typeNames) {
+  return [
+    'NetID', 'First Name', 'Last Name', 'Anonymous',
+    ...typeNames.map(eventType => `# ${eventType} attended`),
+    'Points', 'Last Update'
+  ];
+}
+
+/**
+ * Overwrites a points record sheet with member data. The sheet is cleared in
+ * full (header included) and rewritten, so stale rows from a previous run can
+ * never survive and the column count can grow or shrink with the event types.
  * @param {SpreadsheetApp.Spreadsheet} ss - Spreadsheet object
  * @param {string} sheetName - Sheet to write, e.g. "SP26 Points Record"
  * @param {Map} members - Map of members
+ * @param {Array} typeNames - Event types, in attendance-column order
  */
-function updatePointsRecord(ss, sheetName, members) {
+function updatePointsRecord(ss, sheetName, members, typeNames) {
   const sheet = getOrCreateSemesterSheet(ss, sheetName);
 
   // Clear values only, so any manual formatting on the sheet survives
   sheet.clearContents();
 
   // Prepare data for output, starting with the header row
-  const outputData = [RECORD_HEADER];
+  const header = buildRecordHeader(typeNames);
+  const outputData = [header];
   members.forEach((member, netID) => {
-    const row = [];
-    row[RECORD_COLUMNS.NET_ID] = netID;
-    row[RECORD_COLUMNS.FIRST_NAME] = member[MEMBER_FIELDS.FIRST_NAME];
-    row[RECORD_COLUMNS.LAST_NAME] = member[MEMBER_FIELDS.LAST_NAME];
-    row[RECORD_COLUMNS.ANONYMOUS] = member[MEMBER_FIELDS.ANONYMOUS] ? 'Yes' : 'No';
-    row[RECORD_COLUMNS.POINTS] = member[MEMBER_FIELDS.POINTS];
-    row[RECORD_COLUMNS.LAST_UPDATE] = member[MEMBER_FIELDS.LAST_UPDATE];
-    outputData.push(row);
+    const attendance = member[MEMBER_FIELDS.ATTENDANCE] || {};
+    outputData.push([
+      netID,
+      member[MEMBER_FIELDS.FIRST_NAME],
+      member[MEMBER_FIELDS.LAST_NAME],
+      member[MEMBER_FIELDS.ANONYMOUS] ? 'Yes' : 'No',
+      ...typeNames.map(eventType => attendance[eventType] || 0),
+      member[MEMBER_FIELDS.POINTS],
+      member[MEMBER_FIELDS.LAST_UPDATE]
+    ]);
   });
 
   // Write header and data in a single pass
-  sheet.getRange(1, 1, outputData.length, RECORD_HEADER.length).setValues(outputData);
+  sheet.getRange(1, 1, outputData.length, header.length).setValues(outputData);
 }
